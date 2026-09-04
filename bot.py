@@ -10,6 +10,7 @@ Requires an Arabic-capable TTF font at: fonts/NotoNaskhArabic-Regular.ttf
 
 import os
 import re
+import asyncio
 import hashlib
 import sqlite3
 import logging
@@ -921,21 +922,33 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 
+async def _bulk_delete_chat_history(bot, chat_id, from_message_id, count=200):
+    """يحذف رسائل المحادثة بالتوازي (غير متسلسل) في الخلفية دون تعطيل معالجة بقية الرسائل."""
+    sem = asyncio.Semaphore(15)
+
+    async def _del(mid):
+        async with sem:
+            try:
+                await bot.delete_message(chat_id, mid)
+            except Exception:
+                pass  # رسالة قديمة جداً (خارج حد 48 ساعة) أو محذوفة مسبقاً
+
+    ids = range(from_message_id, max(from_message_id - count, 0), -1)
+    await asyncio.gather(*[_del(mid) for mid in ids])
+
+
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     current_id = update.effective_message.message_id if update.effective_message else None
     context.user_data.clear()
-    if current_id:
-        for mid in range(current_id, max(current_id - 300, 0), -1):
-            try:
-                await context.bot.delete_message(chat_id, mid)
-            except Exception:
-                pass  # الرسالة قديمة جداً أو محذوفة مسبقاً أو خارج حد 48 ساعة
+    # نرسل رسالة التأكيد فوراً بدون انتظار، والحذف يتم في الخلفية بالتوازي
     await context.bot.send_message(
         chat_id,
-        f"🚪 تم تسجيل الخروج ومسح المحادثة.\n\n{COMPANY_NAME}\n\nاضغط على زر الدخول لتسجيل الدخول.",
+        f"🚪 تم تسجيل الخروج.\n\n{COMPANY_NAME}\n\nاضغط على زر الدخول لتسجيل الدخول.",
         reply_markup=LOGIN_KB,
     )
+    if current_id:
+        asyncio.create_task(_bulk_delete_chat_history(context.bot, chat_id, current_id))
     return LOGIN_USERNAME
 
 
@@ -1899,7 +1912,7 @@ async def unknown_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_app():
     init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
