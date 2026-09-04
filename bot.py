@@ -2053,4 +2053,4 @@ def build_app():
 if __name__ == "__main__":
     application = build_app()
     logger.info("Alhaya Pharma collection bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
