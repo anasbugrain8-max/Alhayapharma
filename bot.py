@@ -922,9 +922,18 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    current_id = update.effective_message.message_id if update.effective_message else None
     context.user_data.clear()
-    await update.message.reply_text(
-        f"🚪 تم تسجيل الخروج.\n\n{COMPANY_NAME}\n\nاضغط على زر الدخول لتسجيل الدخول.",
+    if current_id:
+        for mid in range(current_id, max(current_id - 300, 0), -1):
+            try:
+                await context.bot.delete_message(chat_id, mid)
+            except Exception:
+                pass  # الرسالة قديمة جداً أو محذوفة مسبقاً أو خارج حد 48 ساعة
+    await context.bot.send_message(
+        chat_id,
+        f"🚪 تم تسجيل الخروج ومسح المحادثة.\n\n{COMPANY_NAME}\n\nاضغط على زر الدخول لتسجيل الدخول.",
         reply_markup=LOGIN_KB,
     )
     return LOGIN_USERNAME
