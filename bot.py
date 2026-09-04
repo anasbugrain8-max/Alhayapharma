@@ -417,7 +417,7 @@ class ArabicPDF(FPDF):
         if self.font_ready:
             self.add_font("Arabic", "", FONT_PATH)
             self.add_font("Arabic", "B", FONT_PATH)
-        self.set_auto_page_break(auto=True, margin=15)
+        self.set_auto_page_break(auto=True, margin=18)
         self.add_page()
 
     def _font(self, style="", size=12):
@@ -429,7 +429,8 @@ class ArabicPDF(FPDF):
     def header(self):
         if os.path.exists(LOGO_PATH):
             try:
-                self.image(LOGO_PATH, x=10, y=8, w=20)
+                # شعار الشركة أعلى اليمين
+                self.image(LOGO_PATH, x=180, y=6, w=20)
             except Exception:
                 pass
         self.set_fill_color(0, 90, 90)
@@ -448,10 +449,14 @@ class ArabicPDF(FPDF):
         self.ln(4)
 
     def footer(self):
-        self.set_y(-15)
+        self.set_y(-16)
         self._font("", 8)
-        self.set_text_color(120, 120, 120)
-        self.cell(0, 10, ar(f"صفحة {self.page_no()}  —  {COMPANY_NAME}"), align="C")
+        self.set_text_color(150, 150, 150)
+        self.cell(0, 6, f"Page {self.page_no()}", align="C")
+        self.ln(5)
+        self.set_font("Helvetica", "I", 7)
+        self.set_text_color(160, 160, 160)
+        self.cell(0, 5, "Powered by Anas Bu Grain", align="C")
 
     def rtl_cell(self, w, h, text, border=1, align="R", fill=False, style=""):
         self._font(style, 11)
@@ -574,6 +579,40 @@ def generate_method_report_pdf(totals: dict, out_path, period_label=""):
     pdf.output(out_path)
     return out_path
 
+
+async def check_pdf_ready(message_target) -> bool:
+    """Sends a clear warning and returns False if the Arabic font is missing,
+    so PDF generation isn't attempted with a font that can't render Arabic text."""
+    if not os.path.exists(FONT_PATH):
+        await message_target.reply_text(
+            "⚠️ تعذر إنشاء ملف PDF: لم يتم العثور على ملف الخط العربي في المستودع.\n\n"
+            "الرجاء إضافة ملف الخط باسم:\n"
+            "fonts/NotoNaskhArabic-Regular.ttf\n\n"
+            "يمكن تحميله من Google Fonts (Noto Naskh Arabic)، ثم إعادة رفعه إلى مجلد fonts ونشر التحديث."
+        )
+        return False
+    return True
+
+
+async def safe_send_pdf(message_target, generator_func, out_path, filename, *args, **kwargs):
+    """Runs a PDF generator function and sends the result, replying with a friendly
+    error message instead of silently failing if anything goes wrong."""
+    try:
+        generator_func(*args, out_path=out_path, **kwargs)
+        with open(out_path, "rb") as f:
+            await message_target.reply_document(f, filename=filename)
+    except Exception as e:
+        logger.exception("PDF generation/send failed: %s", e)
+        await message_target.reply_text(
+            "❌ حدث خطأ أثناء إنشاء ملف PDF. تأكد من إضافة ملف الخط العربي في مجلد fonts، ثم أعد المحاولة."
+        )
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+
 # ============================================================
 # KEYBOARDS
 # ============================================================
@@ -638,6 +677,95 @@ def method_inline_kb():
     return InlineKeyboardMarkup(buttons)
 
 
+def build_keypad_kb(value):
+    rows = [
+        [InlineKeyboardButton("1", callback_data="kp:1"), InlineKeyboardButton("2", callback_data="kp:2"), InlineKeyboardButton("3", callback_data="kp:3")],
+        [InlineKeyboardButton("4", callback_data="kp:4"), InlineKeyboardButton("5", callback_data="kp:5"), InlineKeyboardButton("6", callback_data="kp:6")],
+        [InlineKeyboardButton("7", callback_data="kp:7"), InlineKeyboardButton("8", callback_data="kp:8"), InlineKeyboardButton("9", callback_data="kp:9")],
+        [InlineKeyboardButton(".", callback_data="kp:."), InlineKeyboardButton("0", callback_data="kp:0"), InlineKeyboardButton("⌫", callback_data="kp:back")],
+        [InlineKeyboardButton("🗑️ مسح", callback_data="kp:clear"), InlineKeyboardButton("✅ تأكيد", callback_data="kp:confirm")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def keypad_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data.split(":", 1)[1]
+    cur = context.user_data.get("kp_value", "")
+    target = context.user_data.get("kp_target")
+
+    if action == "confirm":
+        try:
+            amount = float(cur)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await query.answer("⚠️ أدخل قيمة صحيحة أولاً", show_alert=True)
+            return None
+        await query.answer()
+        context.user_data.pop("kp_value", None)
+        context.user_data.pop("kp_target", None)
+        if target == "collect":
+            context.user_data["collect"]["amount"] = amount
+            await query.edit_message_text(f"💰 قيمة السداد: {amount:,.2f} د.ل")
+            await query.message.reply_text("اختر طريقة السداد:", reply_markup=method_inline_kb())
+            return COLLECT_METHOD
+        elif target == "target":
+            rep_id = context.user_data.pop("target_rep_id", None)
+            if rep_id:
+                m, y = month_year_now()
+                set_target(rep_id, m, y, amount)
+                rep = get_user(rep_id)
+                await query.edit_message_text(f"✅ تم حفظ الهدف الشهري لـ {rep['name']}: {amount:,.2f} د.ل")
+            await send_main_menu(query, context)
+            return MAIN_MENU
+        return None
+
+    await query.answer()
+    if action == "back":
+        cur = cur[:-1]
+    elif action == "clear":
+        cur = ""
+    elif action == ".":
+        if "." not in cur:
+            cur = (cur or "0") + "."
+    else:
+        if len(cur) < 12:
+            cur += action
+    context.user_data["kp_value"] = cur
+    label = "قيمة السداد" if target == "collect" else "قيمة الهدف الشهري"
+    await query.edit_message_text(
+        f"أدخل {label} باستخدام لوحة الأرقام:\n\nالقيمة الحالية: {cur if cur else '0'}",
+        reply_markup=build_keypad_kb(cur),
+    )
+    return None
+
+
+def build_calendar_kb(year, month):
+    import calendar as _cal
+    c = _cal.Calendar(firstweekday=6)  # يبدأ الأسبوع بالأحد
+    weeks = c.monthdayscalendar(year, month)
+    prev_y, prev_m = (year - 1, 12) if month == 1 else (year, month - 1)
+    next_y, next_m = (year + 1, 1) if month == 12 else (year, month + 1)
+    rows = [[
+        InlineKeyboardButton("◀️", callback_data=f"cal:nav:{prev_y}:{prev_m}"),
+        InlineKeyboardButton(f"{MONTHS_AR[month-1]} {year}", callback_data="noop"),
+        InlineKeyboardButton("▶️", callback_data=f"cal:nav:{next_y}:{next_m}"),
+    ]]
+    day_labels = ["أحد", "اثنين", "ثلاثاء", "أربعاء", "خميس", "جمعة", "سبت"]
+    rows.append([InlineKeyboardButton(d, callback_data="noop") for d in day_labels])
+    for week in weeks:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="noop"))
+            else:
+                row.append(InlineKeyboardButton(str(day), callback_data=f"cal:day:{year}:{month}:{day}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("📅 اليوم", callback_data="cal:today")])
+    return InlineKeyboardMarkup(rows)
+
+
 def yesno_kb(yes_cb, no_cb, yes_label="✅ نعم", no_label="❌ إلغاء"):
     return InlineKeyboardMarkup([[InlineKeyboardButton(yes_label, callback_data=yes_cb),
                                     InlineKeyboardButton(no_label, callback_data=no_cb)]])
@@ -664,7 +792,8 @@ def yesno_kb(yes_cb, no_cb, yes_label="✅ نعم", no_label="❌ إلغاء"):
     REPORTS_MENU, REPORT_REP_PICK,
     MSG_PICK_TARGET, MSG_BODY,
     ADMIN_SEARCH_CUSTOMER,
-) = range(29)
+    MSG_CHOOSE_TYPE,
+) = range(30)
 
 CB_METHOD = "method:"
 
@@ -835,7 +964,12 @@ async def collect_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def collect_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["collect"]["customer_name"] = update.message.text.strip()
-    await update.message.reply_text("أدخل قيمة السداد:")
+    context.user_data["kp_target"] = "collect"
+    context.user_data["kp_value"] = ""
+    await update.message.reply_text(
+        "أدخل قيمة السداد باستخدام لوحة الأرقام:\n\nالقيمة الحالية: 0",
+        reply_markup=build_keypad_kb(""),
+    )
     return COLLECT_AMOUNT
 
 
@@ -849,6 +983,8 @@ async def collect_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ الرجاء إدخال رقم صحيح أكبر من صفر لقيمة السداد:")
         return COLLECT_AMOUNT
     context.user_data["collect"]["amount"] = amount
+    context.user_data.pop("kp_value", None)
+    context.user_data.pop("kp_target", None)
     await update.message.reply_text("اختر طريقة السداد:", reply_markup=method_inline_kb())
     return COLLECT_METHOD
 
@@ -859,14 +995,40 @@ async def collect_method_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = int(query.data.split(":")[1])
     method = PAYMENT_METHODS[idx]
     context.user_data["collect"]["method"] = method
-    today = datetime.now().strftime("%Y-%m-%d")
-    context.user_data["collect"]["payment_date"] = today
     await query.edit_message_text(f"طريقة السداد: {method}")
+    now = datetime.now()
     await query.message.reply_text(
-        f"تاريخ السداد (الافتراضي هو تاريخ اليوم {today}).\n"
-        "اكتب تاريخاً آخر بصيغة YYYY-MM-DD أو اضغط تخطي لاستخدام تاريخ اليوم:",
-        reply_markup=SKIP_CANCEL_KB,
+        "📅 اختر تاريخ السداد (أو اكتبه يدوياً بصيغة YYYY-MM-DD):",
+        reply_markup=build_calendar_kb(now.year, now.month),
     )
+    return COLLECT_DATE
+
+
+async def calendar_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")
+    action = parts[1]
+    if action == "nav":
+        await query.answer()
+        y, m = int(parts[2]), int(parts[3])
+        await query.edit_message_reply_markup(reply_markup=build_calendar_kb(y, m))
+        return COLLECT_DATE
+    await query.answer()
+    if action == "today":
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    else:  # "day"
+        y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
+        date_str = f"{y:04d}-{m:02d}-{d:02d}"
+    context.user_data["collect"]["payment_date"] = date_str
+    data = context.user_data["collect"]
+    summary = (
+        f"يرجى تأكيد بيانات السداد:\n\n"
+        f"👤 العميل: {data['customer_name']}\n"
+        f"💰 القيمة: {data['amount']:,.2f} د.ل\n"
+        f"💳 الطريقة: {data['method']}\n"
+        f"📅 التاريخ: {data['payment_date']}"
+    )
+    await query.edit_message_text(summary, reply_markup=yesno_kb("save_payment", "cancel_payment", "💾 حفظ السداد", "❌ إلغاء"))
     return COLLECT_DATE
 
 
@@ -907,9 +1069,28 @@ async def save_payment_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 التاريخ: {data['payment_date']}\n"
         f"👤 المندوب: {session['name']}"
     )
+    await notify_admins_new_payment(context, session, data)
     context.user_data.pop("collect", None)
     await query.message.reply_text("العملية التالية:", reply_markup=main_menu_kb(session))
     return MAIN_MENU
+
+
+async def notify_admins_new_payment(context: ContextTypes.DEFAULT_TYPE, rep_session, data):
+    """يرسل إشعاراً لجميع حسابات المدير عند تسجيل المندوب لعملية سداد جديدة."""
+    text = (
+        f"🔔 عملية سداد جديدة\n\n"
+        f"👤 المندوب: {rep_session['name']}\n"
+        f"🏪 العميل: {data['customer_name']}\n"
+        f"💰 القيمة: {data['amount']:,.2f} د.ل\n"
+        f"💳 الطريقة: {data['method']}\n"
+        f"📅 التاريخ: {data['payment_date']}"
+    )
+    for admin in list_users_by_role("admin"):
+        if admin["telegram_id"]:
+            try:
+                await context.bot.send_message(admin["telegram_id"], text)
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -956,10 +1137,13 @@ async def export_customer_pdf_cb(update: Update, context: ContextTypes.DEFAULT_T
     if not data:
         await query.message.reply_text("انتهت صلاحية هذه النتيجة، أعد البحث من فضلك.")
         return
-    path = f"/tmp/statement_{data['name']}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
-    generate_customer_statement_pdf(data["name"], data["rows"], path)
-    with open(path, "rb") as f:
-        await query.message.reply_document(f, filename=f"كشف حساب - {data['name']}.pdf")
+    if not await check_pdf_ready(query.message):
+        return
+    path = f"/tmp/statement_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+    await safe_send_pdf(
+        query.message, generate_customer_statement_pdf, path,
+        f"كشف حساب - {data['name']}.pdf", data["name"], data["rows"],
+    )
 
 
 # ============================================================
@@ -997,10 +1181,13 @@ async def export_rep_report_pdf_cb(update: Update, context: ContextTypes.DEFAULT
     rows = context.user_data.get("last_rep_report")
     if not rows:
         rows = get_payments_by_rep(session["id"])
-    path = f"/tmp/rep_report_{session['id']}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
-    generate_rep_report_pdf(session["name"], rows, path)
-    with open(path, "rb") as f:
-        await query.message.reply_document(f, filename=f"تقرير سدادات - {session['name']}.pdf")
+    if not await check_pdf_ready(query.message):
+        return
+    path = f"/tmp/rep_report_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+    await safe_send_pdf(
+        query.message, generate_rep_report_pdf, path,
+        f"تقرير سدادات - {session['name']}.pdf", session["name"], rows,
+    )
 
 # ============================================================
 # ADMIN / ASSISTANT: representatives management (👥 المندوبين)
@@ -1326,10 +1513,15 @@ async def target_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     rep_id = int(query.data.split(":")[1])
     context.user_data["target_rep_id"] = rep_id
+    context.user_data["kp_target"] = "target"
+    context.user_data["kp_value"] = ""
     rep = get_user(rep_id)
     m, y = month_year_now()
     await query.edit_message_text(f"المندوب: {rep['name']}\nالشهر الحالي: {MONTHS_AR[m-1]} {y}")
-    await query.message.reply_text("أدخل قيمة الهدف الشهري (سيتم تطبيقه على الشهر الحالي):", reply_markup=CANCEL_KB)
+    await query.message.reply_text(
+        "أدخل قيمة الهدف الشهري باستخدام لوحة الأرقام:\n\nالقيمة الحالية: 0",
+        reply_markup=build_keypad_kb(""),
+    )
     return TARGET_AMOUNT
 
 
@@ -1343,6 +1535,8 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ الرجاء إدخال رقم صحيح أكبر من صفر:")
         return TARGET_AMOUNT
     rep_id = context.user_data.pop("target_rep_id", None)
+    context.user_data.pop("kp_value", None)
+    context.user_data.pop("kp_target", None)
     if rep_id:
         m, y = month_year_now()
         set_target(rep_id, m, y, amount)
@@ -1385,10 +1579,10 @@ async def export_all_payments_pdf_cb(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer("جاري إنشاء الملف...")
     rows = context.user_data.get("last_all_payments") or get_all_payments()
+    if not await check_pdf_ready(query.message):
+        return
     path = f"/tmp/all_payments_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
-    generate_general_report_pdf(rows, path)
-    with open(path, "rb") as f:
-        await query.message.reply_document(f, filename="جميع التحصيلات.pdf")
+    await safe_send_pdf(query.message, generate_general_report_pdf, path, "جميع التحصيلات.pdf", rows)
 
 
 # ============================================================
@@ -1490,21 +1684,16 @@ async def export_report_pdf_cb(update: Update, context: ContextTypes.DEFAULT_TYP
     if not report:
         await query.message.reply_text("انتهت صلاحية هذا التقرير، أعد استخراجه من فضلك.")
         return
+    if not await check_pdf_ready(query.message):
+        return
     kind, data, label = report
     path = f"/tmp/report_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
     if kind == "general":
-        generate_general_report_pdf(data, path, period_label=label)
-        fname = f"{label or 'تقرير'}.pdf"
+        await safe_send_pdf(query.message, generate_general_report_pdf, path, f"{label or 'تقرير'}.pdf", data, period_label=label)
     elif kind == "rep":
-        generate_rep_report_pdf(label, data, path)
-        fname = f"تقرير - {label}.pdf"
+        await safe_send_pdf(query.message, generate_rep_report_pdf, path, f"تقرير - {label}.pdf", label, data)
     elif kind == "method":
-        generate_method_report_pdf(data, path)
-        fname = "تقرير طرق السداد.pdf"
-    else:
-        return
-    with open(path, "rb") as f:
-        await query.message.reply_document(f, filename=fname)
+        await safe_send_pdf(query.message, generate_method_report_pdf, path, "تقرير طرق السداد.pdf", data)
 
 # ============================================================
 # ADMIN / ASSISTANT: send message (📩 إرسال رسالة)
@@ -1525,15 +1714,27 @@ async def msg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 
+CANNED_MESSAGES = {
+    "weak": "⚠️ التحصيل ضعيف، نرجو منك بذل مزيد من الجهد لتحقيق الهدف الشهري.",
+}
+
+
+def msg_type_kb():
+    buttons = [
+        [InlineKeyboardButton("✍️ كتابة رسالة", callback_data="msgtype:custom")],
+        [InlineKeyboardButton("⚠️ رسالة جاهزة: التحصيل ضعيف", callback_data="msgtype:weak")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 async def msg_to_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     kind = query.data.split(":")[1]
     if kind == "all":
         context.user_data["msg_target"] = {"type": "all"}
-        await query.edit_message_text("📢 إرسال لجميع المندوبين")
-        await query.message.reply_text("اكتب الرسالة التي تريد إرسالها:", reply_markup=CANCEL_KB)
-        return MSG_BODY
+        await query.edit_message_text("📢 إرسال لجميع المندوبين\n\nاختر نوع الرسالة:", reply_markup=msg_type_kb())
+        return MSG_CHOOSE_TYPE
     else:
         reps = list_users_by_role("representative", active_only=True)
         buttons = [[InlineKeyboardButton(r["name"], callback_data=f"msgrep:{r['id']}")] for r in reps]
@@ -1547,9 +1748,29 @@ async def msg_pick_rep_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rep_id = int(query.data.split(":")[1])
     rep = get_user(rep_id)
     context.user_data["msg_target"] = {"type": "single", "id": rep_id, "name": rep["name"]}
-    await query.edit_message_text(f"المرسل إليه: {rep['name']}")
-    await query.message.reply_text("اكتب الرسالة:", reply_markup=CANCEL_KB)
-    return MSG_BODY
+    await query.edit_message_text(f"المرسل إليه: {rep['name']}\n\nاختر نوع الرسالة:", reply_markup=msg_type_kb())
+    return MSG_CHOOSE_TYPE
+
+
+async def msg_type_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    kind = query.data.split(":")[1]
+    target = context.user_data.get("msg_target", {})
+    label = "جميع المندوبين" if target.get("type") == "all" else target.get("name", "")
+    if kind == "custom":
+        await query.edit_message_text(f"المرسل إليه: {label}")
+        await query.message.reply_text("اكتب نص الرسالة:", reply_markup=CANCEL_KB)
+        return MSG_BODY
+    body = CANNED_MESSAGES.get(kind)
+    if not body:
+        return MAIN_MENU
+    context.user_data["msg_body"] = body
+    await query.edit_message_text(
+        f"هل تريد إرسال هذه الرسالة إلى {label}؟\n\n«{body}»",
+        reply_markup=yesno_kb("msg_send_confirm", "msg_send_cancel", "✅ نعم، إرسال", "❌ إلغاء"),
+    )
+    return MAIN_MENU
 
 
 async def msg_body_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1705,40 +1926,94 @@ def build_app():
                 CallbackQueryHandler(export_report_pdf_cb, pattern="^export_report_pdf$"),
                 CallbackQueryHandler(msg_to_cb, pattern="^msgto:"),
                 CallbackQueryHandler(msg_pick_rep_cb, pattern="^msgrep:"),
+                CallbackQueryHandler(msg_type_cb, pattern="^msgtype:"),
                 CallbackQueryHandler(msg_send_confirm_cb, pattern="^msg_send_confirm$"),
                 CallbackQueryHandler(msg_send_cancel_cb, pattern="^msg_send_cancel$"),
                 CallbackQueryHandler(noop_cb, pattern="^noop$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router),
             ],
 
-            COLLECT_CUSTOMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_customer)],
-            COLLECT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_amount)],
-            COLLECT_METHOD: [CallbackQueryHandler(collect_method_cb, pattern=f"^{CB_METHOD}")],
+            COLLECT_CUSTOMER: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, collect_customer),
+            ],
+            COLLECT_AMOUNT: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                CallbackQueryHandler(keypad_cb, pattern="^kp:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, collect_amount),
+            ],
+            COLLECT_METHOD: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                CallbackQueryHandler(collect_method_cb, pattern=f"^{CB_METHOD}"),
+            ],
             COLLECT_DATE: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
                 CallbackQueryHandler(save_payment_cb, pattern="^(save_payment|cancel_payment)$"),
+                CallbackQueryHandler(calendar_cb, pattern="^cal:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, collect_date),
             ],
 
-            SEARCH_CUSTOMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_customer_do)],
-            ADMIN_SEARCH_CUSTOMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_customer_do)],
+            SEARCH_CUSTOMER: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, search_customer_do),
+            ],
+            ADMIN_SEARCH_CUSTOMER: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, search_customer_do),
+            ],
 
-            ADD_REP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rep_name)],
-            ADD_REP_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rep_username)],
-            ADD_REP_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rep_password)],
+            ADD_REP_NAME: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_rep_name),
+            ],
+            ADD_REP_USERNAME: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_rep_username),
+            ],
+            ADD_REP_PASSWORD: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_rep_password),
+            ],
 
-            EDIT_REP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_rep_name_do)],
-            EDIT_REP_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_rep_pass_do)],
+            EDIT_REP_NAME: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_rep_name_do),
+            ],
+            EDIT_REP_PASSWORD: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_rep_pass_do),
+            ],
 
-            ADD_ASSIST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_assist_name)],
-            ADD_ASSIST_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_assist_username)],
-            ADD_ASSIST_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_assist_password)],
-            EDIT_ASSIST_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_assist_pass_do)],
+            ADD_ASSIST_NAME: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_assist_name),
+            ],
+            ADD_ASSIST_USERNAME: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_assist_username),
+            ],
+            ADD_ASSIST_PASSWORD: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_assist_password),
+            ],
+            EDIT_ASSIST_PASSWORD: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_assist_pass_do),
+            ],
 
             TARGET_PICK_REP: [CallbackQueryHandler(target_pick_cb, pattern="^target_pick:")],
-            TARGET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, target_amount_do)],
+            TARGET_AMOUNT: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                CallbackQueryHandler(keypad_cb, pattern="^kp:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, target_amount_do),
+            ],
 
             MSG_PICK_TARGET: [CallbackQueryHandler(msg_pick_rep_cb, pattern="^msgrep:")],
-            MSG_BODY: [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_body_do)],
+            MSG_CHOOSE_TYPE: [CallbackQueryHandler(msg_type_cb, pattern="^msgtype:")],
+            MSG_BODY: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_body_do),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
