@@ -127,7 +127,8 @@ PERMISSIONS = {
     "collect_payments": "💰 تسجيل عمليات تحصيل",
     "receive_feedback": "📢 استلام بلاغ/فكرة تطوير",
     "view_rep_status": "📶 حالة المندوبين",
-    "manage_category_targets": "🎯 أهداف Home/Professional Use",
+    "manage_home_target": "🏠 هدف Home Use",
+    "manage_professional_target": "🩺 هدف Professional Use",
 }
 DEFAULT_ON_PERMS = {"view_representatives", "view_payments", "search_customers", "view_reports", "export_pdf", "send_messages"}
 
@@ -981,8 +982,13 @@ def main_menu_kb(session):
         rows.append(["📩 إرسال رسالة"])
     if perms.get("view_rep_status"):
         rows.append(["📶 حالة المندوبين"])
-    if perms.get("manage_category_targets"):
-        rows.append(["🏠 Home Use target", "🩺 Professional Use target"])
+    cat_row = []
+    if perms.get("manage_home_target"):
+        cat_row.append("🏠 Home Use target")
+    if perms.get("manage_professional_target"):
+        cat_row.append("🩺 Professional Use target")
+    if cat_row:
+        rows.append(cat_row)
     rows.append(["📢 إبلاغ/فكرة تطوير"])
     rows.append(["❌ إلغاء الأمر", "🚪 خروج"])
     return kb(rows)
@@ -1044,10 +1050,9 @@ async def keypad_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_main_menu(query, context)
             return MAIN_MENU
         elif target and target.startswith("category:"):
-            category = target.split(":", 1)[1]
-            m, y = month_year_now()
-            set_category_target(category, m, y, amount)
-            await query.edit_message_text(f"✅ تم حفظ هدف {CATEGORY_LABELS[category]} الشهري: {amount:,.2f} د.ل")
+            _, category, month, year = target.split(":")
+            set_category_target(category, int(month), int(year), amount)
+            await query.edit_message_text(f"✅ تم حفظ هدف {CATEGORY_LABELS[category]} لشهر {month}-{year}: {amount:,.2f} د.ل")
             await send_main_menu(query, context)
             return MAIN_MENU
         return None
@@ -2182,10 +2187,9 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_main_menu(update, context)
         return MAIN_MENU
     if target and target.startswith("category:"):
-        category = target.split(":", 1)[1]
-        m, y = month_year_now()
-        set_category_target(category, m, y, amount)
-        await update.message.reply_text(f"✅ تم حفظ هدف {CATEGORY_LABELS[category]} الشهري: {amount:,.2f} د.ل")
+        _, category, month, year = target.split(":")
+        set_category_target(category, int(month), int(year), amount)
+        await update.message.reply_text(f"✅ تم حفظ هدف {CATEGORY_LABELS[category]} لشهر {month}-{year}: {amount:,.2f} د.ل")
         await send_main_menu(update, context)
         return MAIN_MENU
     rep_id = context.user_data.pop("target_rep_id", None)
@@ -2202,26 +2206,40 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ADMIN / ASSISTANT: all payments overview (💰 الجباية)
 # ============================================================
 
-async def category_target_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, category):
-    if await check_timeout(update, context):
-        return LOGIN_USERNAME
-    session = session_of(context)
-    if session["role"] != "admin" and not user_has_permission(session, "manage_category_targets"):
-        await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
-        return MAIN_MENU
-    target, collected, remaining, pct, rows = category_target_progress(category)
+def category_permission_for(category):
+    return "manage_home_target" if category == "home" else "manage_professional_target"
+
+
+def render_category_report(category, month, year):
+    target, collected, remaining, pct, rows = category_target_progress(category, month, year)
     reps = [u for u in list_users_by_role("representative") if u["category"] == category]
     rep_names = "، ".join(r["name"] for r in reps) if reps else "لا يوجد مندوبون في هذا التصنيف بعد"
     label = CATEGORY_LABELS[category]
     text = (
-        f"{label}\n\n"
+        f"{label}\n"
+        f"الشهر: {month}-{year}\n\n"
         f"المندوبون في هذا التصنيف: {rep_names}\n\n"
         f"{target_progress_text(target, collected, remaining, pct)}"
     )
-    context.user_data["last_report"] = ("general", rows, label, (target, collected, remaining, pct))
-    buttons = [[InlineKeyboardButton("✏️ تحديد/تعديل الهدف", callback_data=f"cattarget_set:{category}")]]
+    buttons = [
+        [InlineKeyboardButton("✏️ تحديد/تعديل الهدف لهذا الشهر", callback_data=f"cattarget_set:{category}:{month}:{year}")],
+    ]
     if target:
-        buttons.append([InlineKeyboardButton("🗑️ حذف الهدف الحالي", callback_data=f"cattarget_delete:{category}")])
+        buttons.append([InlineKeyboardButton("🗑️ حذف هدف هذا الشهر", callback_data=f"cattarget_delete:{category}:{month}:{year}")])
+    buttons.append([InlineKeyboardButton("📅 اختيار شهر آخر (بالأرقام)", callback_data=f"catmonth:{category}:nav:{year}")])
+    return text, buttons, rows, (target, collected, remaining, pct), label
+
+
+async def category_target_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, category):
+    if await check_timeout(update, context):
+        return LOGIN_USERNAME
+    session = session_of(context)
+    if session["role"] != "admin" and not user_has_permission(session, category_permission_for(category)):
+        await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
+        return MAIN_MENU
+    month, year = month_year_now()
+    text, buttons, rows, target_info, label = render_category_report(category, month, year)
+    context.user_data["last_report"] = ("general", rows, f"{label} - شهر {month}-{year}", target_info)
     if user_has_permission(session, "export_pdf"):
         buttons.append([InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")])
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -2236,14 +2254,39 @@ async def professional_use_target_menu(update: Update, context: ContextTypes.DEF
     return await category_target_menu(update, context, "professional")
 
 
+async def catmonth_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    parts = query.data.split(":")  # catmonth : category : nav/pick : year [: month]
+    category = parts[1]
+    if session["role"] != "admin" and not user_has_permission(session, category_permission_for(category)):
+        await query.edit_message_text("⛔ ليست لديك صلاحية لهذا القسم.")
+        return
+    action = parts[2]
+    if action == "nav":
+        year = int(parts[3])
+        await query.edit_message_reply_markup(reply_markup=month_number_kb(f"catmonth:{category}", year))
+        return
+    year, month = int(parts[3]), int(parts[4])
+    text, buttons, rows, target_info, label = render_category_report(category, month, year)
+    context.user_data["last_report"] = ("general", rows, f"{label} - شهر {month}-{year}", target_info)
+    if user_has_permission(session, "export_pdf"):
+        buttons.append([InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
 async def cattarget_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    category = query.data.split(":")[1]
-    context.user_data["kp_target"] = f"category:{category}"
+    session = session_of(context)
+    _, category, month, year = query.data.split(":")
+    if session["role"] != "admin" and not user_has_permission(session, category_permission_for(category)):
+        await query.edit_message_text("⛔ ليست لديك صلاحية لهذا القسم.")
+        return
+    context.user_data["kp_target"] = f"category:{category}:{month}:{year}"
     context.user_data["kp_value"] = ""
-    m, y = month_year_now()
-    await query.edit_message_text(f"{CATEGORY_LABELS[category]}\nالشهر الحالي: {MONTHS_AR[m-1]} {y}")
+    await query.edit_message_text(f"{CATEGORY_LABELS[category]}\nالشهر: {month}-{year}")
     await query.message.reply_text(
         "أدخل قيمة الهدف الشهري باستخدام لوحة الأرقام:\n\nالقيمة الحالية: 0",
         reply_markup=build_keypad_kb(""),
@@ -2254,20 +2297,19 @@ async def cattarget_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cattarget_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    category = query.data.split(":")[1]
+    _, category, month, year = query.data.split(":")
     await query.edit_message_text(
-        f"⚠️ هل تريد حذف هدف {CATEGORY_LABELS[category]} لهذا الشهر؟",
-        reply_markup=yesno_kb(f"cattarget_delete_do:{category}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
+        f"⚠️ هل تريد حذف هدف {CATEGORY_LABELS[category]} لشهر {month}-{year}؟",
+        reply_markup=yesno_kb(f"cattarget_delete_do:{category}:{month}:{year}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
     )
 
 
 async def cattarget_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("تم الحذف")
-    category = query.data.split(":")[1]
-    m, y = month_year_now()
-    delete_category_target(category, m, y)
-    await query.edit_message_text(f"🗑️ تم حذف هدف {CATEGORY_LABELS[category]} لشهر {MONTHS_AR[m-1]} {y}.")
+    _, category, month, year = query.data.split(":")
+    delete_category_target(category, int(month), int(year))
+    await query.edit_message_text(f"🗑️ تم حذف هدف {CATEGORY_LABELS[category]} لشهر {month}-{year}.")
 
 
 def build_rep_status_text():
@@ -3142,6 +3184,7 @@ def build_app():
                 CallbackQueryHandler(cattarget_set_cb, pattern="^cattarget_set:"),
                 CallbackQueryHandler(cattarget_delete_cb, pattern="^cattarget_delete:"),
                 CallbackQueryHandler(cattarget_delete_do_cb, pattern="^cattarget_delete_do:"),
+                CallbackQueryHandler(catmonth_cb, pattern="^catmonth:"),
                 CallbackQueryHandler(noop_cb, pattern="^noop$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router),
             ],
