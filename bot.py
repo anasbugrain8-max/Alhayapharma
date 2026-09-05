@@ -607,11 +607,19 @@ def generate_customer_statement_pdf(customer_name, rows, out_path):
     return out_path
 
 
-def generate_rep_report_pdf(rep_name, rows, out_path, period_label=""):
+def generate_rep_report_pdf(rep_name, rows, out_path, period_label="", target_info=None):
     pdf = ArabicPDF(subtitle=f"تقرير سدادات المندوب — {rep_name}")
     if period_label:
         pdf.info_line("الفترة", period_label)
     pdf.info_line("تاريخ الاستخراج", datetime.now().strftime("%Y-%m-%d"))
+    if target_info:
+        target, collected, remaining, pct = target_info
+        if target:
+            pdf.ln(1)
+            pdf._font("B", 12)
+            pdf.set_fill_color(230, 245, 245)
+            pdf.cell(0, 8, ar(f"الهدف الشهري: {target:,.2f} د.ل   |   المحصل: {collected:,.2f} د.ل ({pct:.1f}%)   |   المتبقي: {remaining:,.2f} د.ل"), align="R", fill=True)
+            pdf.ln(9)
     pdf.ln(2)
     headers = ["طريقة السداد", "قيمة السداد", "تاريخ السداد", "اسم العميل"]
     widths = [45, 35, 35, 55]
@@ -925,13 +933,24 @@ def month_year_now():
     return now.month, now.year
 
 
-def current_month_target_progress(rep_id):
-    m, y = month_year_now()
-    target = get_target(rep_id, m, y)
-    collected = get_total(get_payments_by_rep(rep_id, m, y))
+def current_month_target_progress(rep_id, month=None, year=None):
+    if month is None or year is None:
+        month, year = month_year_now()
+    target = get_target(rep_id, month, year)
+    collected = get_total(get_payments_by_rep(rep_id, month, year))
     remaining = max(target - collected, 0)
     pct = (collected / target * 100) if target else 0
     return target, collected, remaining, pct
+
+
+def target_progress_text(target, collected, remaining, pct):
+    if not target:
+        return "🎯 لم يتم تحديد هدف شهري بعد لهذا المندوب."
+    return (
+        f"🎯 الهدف الشهري: {target:,.2f} د.ل\n"
+        f"✅ تم تحصيل: {collected:,.2f} د.ل ({pct:.1f}%)\n"
+        f"⏳ المتبقي للوصول للهدف: {remaining:,.2f} د.ل"
+    )
 
 
 # ============================================================
@@ -1175,13 +1194,19 @@ async def save_payment_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_main_menu(query, context)
         return MAIN_MENU
     add_payment(data["customer_name"], data["amount"], data["method"], data["payment_date"], session["id"])
+    try:
+        pay_month, pay_year = map(int, data["payment_date"].split("-")[1::-1])
+    except Exception:
+        pay_month, pay_year = month_year_now()
+    target, collected, remaining, pct = current_month_target_progress(session["id"], pay_month, pay_year)
     await query.edit_message_text(
         "✅ تم تسجيل السداد بنجاح\n\n"
         f"👤 العميل: {data['customer_name']}\n"
         f"💰 القيمة: {data['amount']:,.2f} د.ل\n"
         f"💳 الطريقة: {data['method']}\n"
         f"📅 التاريخ: {data['payment_date']}\n"
-        f"👤 المندوب: {session['name']}"
+        f"👤 المندوب: {session['name']}\n\n"
+        f"{target_progress_text(target, collected, remaining, pct)}"
     )
     await notify_admins_new_payment(context, session, data)
     context.user_data.pop("collect", None)
@@ -1279,13 +1304,17 @@ async def rep_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("لا توجد سدادات مسجلة بعد.", reply_markup=main_menu_kb(session))
         return MAIN_MENU
     total = get_total(rows)
+    target, collected, remaining, pct = current_month_target_progress(session["id"])
     lines = [f"📊 تقرير سدادات: {session['name']}\n"]
+    lines.append(target_progress_text(target, collected, remaining, pct))
+    lines.append("")
     for r in rows[:30]:
         lines.append(f"• {r['customer_name']} | {r['amount']:,.2f} د.ل | {r['payment_date']} | {r['method']}")
     if len(rows) > 30:
         lines.append(f"... و {len(rows)-30} عملية أخرى")
-    lines.append(f"\nإجمالي السدادات: {total:,.2f} د.ل")
+    lines.append(f"\nإجمالي السدادات (كل الفترات): {total:,.2f} د.ل")
     context.user_data["last_rep_report"] = rows
+    context.user_data["last_rep_target"] = (target, collected, remaining, pct)
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📄 تصدير التقرير PDF", callback_data="export_rep_report_pdf")]]),
@@ -1301,12 +1330,14 @@ async def export_rep_report_pdf_cb(update: Update, context: ContextTypes.DEFAULT
     rows = context.user_data.get("last_rep_report")
     if not rows:
         rows = get_payments_by_rep(session["id"])
+    target_info = context.user_data.get("last_rep_target") or current_month_target_progress(session["id"])
     if not await check_pdf_ready(query.message):
         return
     path = f"/tmp/rep_report_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
     await safe_send_pdf(
         query.message, generate_rep_report_pdf, path,
         f"تقرير سدادات - {session['name']}.pdf", session["name"], rows,
+        target_info=target_info,
     )
 
 # ============================================================
@@ -1975,7 +2006,7 @@ async def report_rep_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"الهدف الشهري: {target:,.2f} د.ل\nالمحصل هذا الشهر: {collected:,.2f} د.ل\n"
         f"المتبقي: {remaining:,.2f} د.ل\nنسبة الإنجاز: {pct:.1f}%"
     )
-    context.user_data["last_report"] = ("rep", rows, rep["name"])
+    context.user_data["last_report"] = ("rep", rows, rep["name"], (target, collected, remaining, pct))
     can_export = user_has_permission(session, "export_pdf")
     buttons = []
     if can_export:
@@ -2016,8 +2047,15 @@ async def repmonthpick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = get_payments_by_rep(rep_id, month, year)
     total = get_total(rows)
     label = f"{rep['name']} - شهر {month}-{year}"
-    text = f"👨‍💼 سدادات {rep['name']} - شهر {month}-{year}\n\nعدد العمليات: {len(rows)}\nالإجمالي: {total:,.2f} د.ل"
-    context.user_data["last_report"] = ("rep", rows, label)
+    target = get_target(rep_id, month, year)
+    remaining = max(target - total, 0)
+    pct = (total / target * 100) if target else 0
+    text = (
+        f"👨‍💼 سدادات {rep['name']} - شهر {month}-{year}\n\n"
+        f"عدد العمليات: {len(rows)}\nالإجمالي: {total:,.2f} د.ل\n\n"
+        f"{target_progress_text(target, total, remaining, pct)}"
+    )
+    context.user_data["last_report"] = ("rep", rows, label, (target, total, remaining, pct))
     can_export = user_has_permission(session, "export_pdf")
     buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if can_export else None
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
@@ -2032,12 +2070,13 @@ async def export_report_pdf_cb(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if not await check_pdf_ready(query.message):
         return
-    kind, data, label = report
+    kind, data, label = report[0], report[1], report[2]
+    target_info = report[3] if len(report) > 3 else None
     path = f"/tmp/report_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
     if kind == "general":
         await safe_send_pdf(query.message, generate_general_report_pdf, path, f"{label or 'تقرير'}.pdf", data, period_label=label)
     elif kind == "rep":
-        await safe_send_pdf(query.message, generate_rep_report_pdf, path, f"تقرير - {label}.pdf", label, data)
+        await safe_send_pdf(query.message, generate_rep_report_pdf, path, f"تقرير - {label}.pdf", label, data, target_info=target_info)
     elif kind == "method":
         await safe_send_pdf(query.message, generate_method_report_pdf, path, "تقرير طرق السداد.pdf", data)
 
