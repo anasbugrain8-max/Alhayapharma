@@ -126,6 +126,8 @@ PERMISSIONS = {
     "edit_payments": "✏️ تعديل/حذف السدادات",
     "collect_payments": "💰 تسجيل عمليات تحصيل",
     "receive_feedback": "📢 استلام بلاغ/فكرة تطوير",
+    "view_rep_status": "📶 حالة المندوبين",
+    "manage_category_targets": "🎯 أهداف Home/Professional Use",
 }
 DEFAULT_ON_PERMS = {"view_representatives", "view_payments", "search_customers", "view_reports", "export_pdf", "send_messages"}
 
@@ -159,9 +161,19 @@ def init_db():
             role TEXT NOT NULL CHECK(role IN ('admin','assistant','representative')),
             active INTEGER NOT NULL DEFAULT 1,
             telegram_id INTEGER,
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TEXT DEFAULT (datetime('now')),
+            last_seen TEXT,
+            category TEXT NOT NULL DEFAULT 'home'
         )
     """)
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN category TEXT NOT NULL DEFAULT 'home'")
+    except sqlite3.OperationalError:
+        pass
     c.execute("""
         CREATE TABLE IF NOT EXISTS assistant_permissions (
             user_id INTEGER NOT NULL,
@@ -192,6 +204,16 @@ def init_db():
             target_amount REAL NOT NULL,
             UNIQUE(representative_id, month, year),
             FOREIGN KEY(representative_id) REFERENCES users(id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS category_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            month INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            target_amount REAL NOT NULL,
+            UNIQUE(category, month, year)
         )
     """)
     c.execute("""
@@ -302,6 +324,13 @@ def get_user(user_id):
 def set_telegram_id(user_id, telegram_id):
     conn = get_db()
     conn.execute("UPDATE users SET telegram_id=? WHERE id=?", (telegram_id, user_id))
+    conn.commit()
+    conn.close()
+
+
+def update_last_seen(user_id):
+    conn = get_db()
+    conn.execute("UPDATE users SET last_seen=datetime('now') WHERE id=?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -533,6 +562,69 @@ def delete_target(rep_id, month, year):
     conn.execute("DELETE FROM targets WHERE representative_id=? AND month=? AND year=?", (rep_id, month, year))
     conn.commit()
     conn.close()
+
+
+CATEGORY_LABELS = {"home": "🏠 Home Use", "professional": "🩺 Professional Use"}
+
+
+def set_rep_category(rep_id, category):
+    conn = get_db()
+    conn.execute("UPDATE users SET category=? WHERE id=?", (category, rep_id))
+    conn.commit()
+    conn.close()
+
+
+def set_category_target(category, month, year, amount):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO category_targets (category, month, year, target_amount) VALUES (?,?,?,?) "
+        "ON CONFLICT(category, month, year) DO UPDATE SET target_amount=excluded.target_amount",
+        (category, month, year, amount),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_category_target(category, month, year):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT target_amount FROM category_targets WHERE category=? AND month=? AND year=?",
+        (category, month, year),
+    ).fetchone()
+    conn.close()
+    return row["target_amount"] if row else 0
+
+
+def delete_category_target(category, month, year):
+    conn = get_db()
+    conn.execute("DELETE FROM category_targets WHERE category=? AND month=? AND year=?", (category, month, year))
+    conn.commit()
+    conn.close()
+
+
+def get_category_payments(category, month=None, year=None):
+    conn = get_db()
+    q = """SELECT p.*, u.name as rep_name FROM payments p JOIN users u ON u.id=p.representative_id
+           WHERE u.category=?"""
+    params = [category]
+    if month and year:
+        q += " AND strftime('%m', p.payment_date)=? AND strftime('%Y', p.payment_date)=?"
+        params += [f"{month:02d}", str(year)]
+    q += " ORDER BY p.payment_date DESC, p.id DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return rows
+
+
+def category_target_progress(category, month=None, year=None):
+    if month is None or year is None:
+        month, year = month_year_now()
+    target = get_category_target(category, month, year)
+    rows = get_category_payments(category, month, year)
+    collected = get_total(rows)
+    remaining = max(target - collected, 0)
+    pct = (collected / target * 100) if target else 0
+    return target, collected, remaining, pct, rows
 
 
 def log_message(sender_id, recipient_id, recipient_type, body):
@@ -830,6 +922,8 @@ ADMIN_MENU_ROWS = [
     ["👨‍💼 المساعدين", "🎯 أهداف التحصيل"],
     ["💰 الجباية", "🔍 البحث عن عميل"],
     ["📊 التقارير", "📩 إرسال رسالة"],
+    ["📶 حالة المندوبين"],
+    ["🏠 Home Use target", "🩺 Professional Use target"],
     ["📢 إبلاغ/فكرة تطوير"],
     ["❌ إلغاء الأمر", "🚪 خروج"],
 ]
@@ -867,6 +961,10 @@ def main_menu_kb(session):
         rows.append(rows3)
     if perms.get("send_messages"):
         rows.append(["📩 إرسال رسالة"])
+    if perms.get("view_rep_status"):
+        rows.append(["📶 حالة المندوبين"])
+    if perms.get("manage_category_targets"):
+        rows.append(["🏠 Home Use target", "🩺 Professional Use target"])
     rows.append(["📢 إبلاغ/فكرة تطوير"])
     rows.append(["❌ إلغاء الأمر", "🚪 خروج"])
     return kb(rows)
@@ -925,6 +1023,13 @@ async def keypad_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if payment_id and user_has_permission(session, "edit_payments"):
                 update_payment_amount(payment_id, amount)
                 await query.edit_message_text(f"✅ تم تحديث قيمة السداد إلى: {amount:,.2f} د.ل")
+            await send_main_menu(query, context)
+            return MAIN_MENU
+        elif target and target.startswith("category:"):
+            category = target.split(":", 1)[1]
+            m, y = month_year_now()
+            set_category_target(category, m, y, amount)
+            await query.edit_message_text(f"✅ تم حفظ هدف {CATEGORY_LABELS[category]} الشهري: {amount:,.2f} د.ل")
             await send_main_menu(query, context)
             return MAIN_MENU
         return None
@@ -1018,6 +1123,9 @@ def session_of(context):
 
 def touch_session(context):
     context.user_data["last_active"] = datetime.now()
+    session = context.user_data.get("session")
+    if session:
+        update_last_seen(session["id"])
 
 
 def session_expired(context):
@@ -1036,6 +1144,26 @@ async def send_main_menu(update_or_query, context, text="القائمة الرئ
 def month_year_now():
     now = datetime.now()
     return now.month, now.year
+
+
+def format_last_seen(last_seen_str):
+    """يعرض آخر وقت تفاعل فيه المستخدم مع البوت (أقرب بديل ممكن لحالة أونلاين/أوفلاين،
+    لأن تيليجرام لا يمنح البوتات صلاحية معرفة حالة الاتصال الفعلية لأي مستخدم)."""
+    if not last_seen_str:
+        return "لم يسجّل الدخول عبر البوت بعد"
+    try:
+        last_seen = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return last_seen_str
+    delta = datetime.now() - last_seen
+    seconds = delta.total_seconds()
+    if seconds < 120:
+        return "🟢 نشط الآن تقريباً (قبل أقل من دقيقتين)"
+    if seconds < 3600:
+        return f"🟡 آخر نشاط: منذ {int(seconds // 60)} دقيقة"
+    if seconds < 86400:
+        return f"⚪ آخر نشاط: منذ {int(seconds // 3600)} ساعة"
+    return f"⚪ آخر نشاط: منذ {int(seconds // 86400)} يوم"
 
 
 def current_month_target_progress(rep_id, month=None, year=None):
@@ -1611,7 +1739,9 @@ async def rep_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"اسم المندوب: {rep['name']}\n"
         f"اسم المستخدم: {rep['username']}\n"
-        f"الحالة: {'✅ نشط' if rep['active'] else '⛔ موقوف'}\n\n"
+        f"الحالة: {'✅ نشط' if rep['active'] else '⛔ موقوف'}\n"
+        f"التصنيف: {CATEGORY_LABELS.get(rep['category'], rep['category'])}\n"
+        f"{format_last_seen(rep['last_seen'])}\n\n"
         f"{target_progress_text(target, collected, remaining, pct)}\n\n"
         f"عدد عمليات السداد (إجمالي): {count} عملية"
     )
@@ -1620,9 +1750,21 @@ async def rep_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton("✏️ تعديل الاسم", callback_data=f"rep_editname:{rep_id}")])
         buttons.append([InlineKeyboardButton("🔒 تغيير الرقم السري", callback_data=f"rep_editpass:{rep_id}")])
         buttons.append([InlineKeyboardButton(("⛔ إيقاف" if rep["active"] else "✅ تفعيل"), callback_data=f"rep_toggle:{rep_id}")])
+        other_cat = "professional" if rep["category"] == "home" else "home"
+        buttons.append([InlineKeyboardButton(f"🏷️ نقل إلى {CATEGORY_LABELS[other_cat]}", callback_data=f"rep_setcat:{rep_id}:{other_cat}")])
     if user_has_permission(session, "delete_representatives"):
         buttons.append([InlineKeyboardButton("🗑️ حذف المندوب", callback_data=f"rep_delete_confirm:{rep_id}")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
+async def rep_setcat_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    rep_id = int(query.data.split(":")[1])
+    new_cat = query.data.split(":")[2]
+    set_rep_category(rep_id, new_cat)
+    await query.answer(f"تم النقل إلى {CATEGORY_LABELS.get(new_cat, new_cat)}")
+    query.data = f"rep_view:{rep_id}"
+    await rep_view_cb(update, context)
 
 
 async def rep_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1750,11 +1892,50 @@ async def assistants_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ هذا القسم خاص بالمدير فقط.")
         return MAIN_MENU
     assistants = list_users_by_role("assistant")
-    buttons = [[InlineKeyboardButton(("✅ " if a["active"] else "⛔ ") + a["name"], callback_data=f"assist_view:{a['id']}")] for a in assistants]
+    buttons = [[InlineKeyboardButton(f"👑 حسابي (المدير): {session['name']}", callback_data="admin_self_view")]]
+    buttons += [[InlineKeyboardButton(("✅ " if a["active"] else "⛔ ") + a["name"], callback_data=f"assist_view:{a['id']}")] for a in assistants]
     text = "👨‍💼 قائمة المساعدين:" if assistants else "لا يوجد مساعدون مسجلون بعد."
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     await update.message.reply_text("لإضافة مساعد جديد:", reply_markup=kb([["➕ إضافة مساعد"], ["🔙 رجوع للقائمة الرئيسية"]]))
     return MAIN_MENU
+
+
+async def admin_self_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if session["role"] != "admin":
+        await query.edit_message_text("⛔ هذا القسم خاص بالمدير فقط.")
+        return
+    admin = get_user(session["id"])
+    text = f"👑 حسابي (المدير)\n\nالاسم: {admin['name']}\nاسم المستخدم: {admin['username']}"
+    buttons = [
+        [InlineKeyboardButton("✏️ تغيير الاسم", callback_data="admin_self_editname")],
+        [InlineKeyboardButton("🔒 تغيير الرقم السري", callback_data="admin_self_editpass")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_self_editname_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if session["role"] != "admin":
+        return
+    context.user_data["edit_rep_id"] = session["id"]
+    await query.message.reply_text("أدخل اسمك الجديد:", reply_markup=CANCEL_KB)
+    return EDIT_REP_NAME
+
+
+async def admin_self_editpass_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if session["role"] != "admin":
+        return
+    context.user_data["edit_rep_id"] = session["id"]
+    await query.message.reply_text("أدخل رقمك السري الجديد:", reply_markup=CANCEL_KB)
+    return EDIT_REP_PASSWORD
 
 
 async def assist_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1764,7 +1945,7 @@ async def assist_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     a = get_user(assist_id)
     perms = get_permissions(assist_id)
     perm_lines = "\n".join(f"{'☑️' if v else '☐'} {PERMISSIONS[k]}" for k, v in perms.items())
-    text = f"اسم المساعد: {a['name']}\nاسم المستخدم: {a['username']}\nالحالة: {'✅ نشط' if a['active'] else '⛔ موقوف'}\n\nالصلاحيات:\n{perm_lines}"
+    text = f"اسم المساعد: {a['name']}\nاسم المستخدم: {a['username']}\nالحالة: {'✅ نشط' if a['active'] else '⛔ موقوف'}\n{format_last_seen(a['last_seen'])}\n\nالصلاحيات:\n{perm_lines}"
     buttons = [
         [InlineKeyboardButton("⚙️ تعديل الصلاحيات", callback_data=f"assist_perms:{assist_id}")],
         [InlineKeyboardButton("🔒 تغيير الرقم السري", callback_data=f"assist_editpass:{assist_id}")],
@@ -1982,6 +2163,13 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ تم تحديث قيمة السداد إلى: {amount:,.2f} د.ل")
         await send_main_menu(update, context)
         return MAIN_MENU
+    if target and target.startswith("category:"):
+        category = target.split(":", 1)[1]
+        m, y = month_year_now()
+        set_category_target(category, m, y, amount)
+        await update.message.reply_text(f"✅ تم حفظ هدف {CATEGORY_LABELS[category]} الشهري: {amount:,.2f} د.ل")
+        await send_main_menu(update, context)
+        return MAIN_MENU
     rep_id = context.user_data.pop("target_rep_id", None)
     if rep_id:
         m, y = month_year_now()
@@ -1995,6 +2183,112 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # ADMIN / ASSISTANT: all payments overview (💰 الجباية)
 # ============================================================
+
+async def category_target_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, category):
+    if await check_timeout(update, context):
+        return LOGIN_USERNAME
+    session = session_of(context)
+    if session["role"] != "admin" and not user_has_permission(session, "manage_category_targets"):
+        await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
+        return MAIN_MENU
+    target, collected, remaining, pct, rows = category_target_progress(category)
+    reps = [u for u in list_users_by_role("representative") if u["category"] == category]
+    rep_names = "، ".join(r["name"] for r in reps) if reps else "لا يوجد مندوبون في هذا التصنيف بعد"
+    label = CATEGORY_LABELS[category]
+    text = (
+        f"{label}\n\n"
+        f"المندوبون في هذا التصنيف: {rep_names}\n\n"
+        f"{target_progress_text(target, collected, remaining, pct)}"
+    )
+    buttons = [[InlineKeyboardButton("✏️ تحديد/تعديل الهدف", callback_data=f"cattarget_set:{category}")]]
+    if target:
+        buttons.append([InlineKeyboardButton("🗑️ حذف الهدف الحالي", callback_data=f"cattarget_delete:{category}")])
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    return MAIN_MENU
+
+
+async def home_use_target_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await category_target_menu(update, context, "home")
+
+
+async def professional_use_target_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await category_target_menu(update, context, "professional")
+
+
+async def cattarget_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    category = query.data.split(":")[1]
+    context.user_data["kp_target"] = f"category:{category}"
+    context.user_data["kp_value"] = ""
+    m, y = month_year_now()
+    await query.edit_message_text(f"{CATEGORY_LABELS[category]}\nالشهر الحالي: {MONTHS_AR[m-1]} {y}")
+    await query.message.reply_text(
+        "أدخل قيمة الهدف الشهري باستخدام لوحة الأرقام:\n\nالقيمة الحالية: 0",
+        reply_markup=build_keypad_kb(""),
+    )
+    return TARGET_AMOUNT
+
+
+async def cattarget_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    category = query.data.split(":")[1]
+    await query.edit_message_text(
+        f"⚠️ هل تريد حذف هدف {CATEGORY_LABELS[category]} لهذا الشهر؟",
+        reply_markup=yesno_kb(f"cattarget_delete_do:{category}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
+    )
+
+
+async def cattarget_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("تم الحذف")
+    category = query.data.split(":")[1]
+    m, y = month_year_now()
+    delete_category_target(category, m, y)
+    await query.edit_message_text(f"🗑️ تم حذف هدف {CATEGORY_LABELS[category]} لشهر {MONTHS_AR[m-1]} {y}.")
+
+
+def build_rep_status_text():
+    reps = list_users_by_role("representative")
+    if not reps:
+        return "لا يوجد مندوبون مسجّلون بعد."
+    lines = ["📶 حالة المندوبين:\n"]
+    for r in reps:
+        status_tag = "" if r["active"] else " (⛔ موقوف)"
+        lines.append(f"👤 {r['name']}{status_tag}\n{format_last_seen(r['last_seen'])}\n")
+    return "\n".join(lines)
+
+
+async def rep_status_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_timeout(update, context):
+        return LOGIN_USERNAME
+    session = session_of(context)
+    if session["role"] != "admin" and not user_has_permission(session, "view_rep_status"):
+        await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
+        return MAIN_MENU
+    text = build_rep_status_text()
+    await update.message.reply_text(
+        text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 تحديث", callback_data="rep_status_refresh")]])
+    )
+    return MAIN_MENU
+
+
+async def rep_status_refresh_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("تم التحديث")
+    session = session_of(context)
+    if session["role"] != "admin" and not user_has_permission(session, "view_rep_status"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية لهذا القسم.")
+        return
+    text = build_rep_status_text()
+    try:
+        await query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 تحديث", callback_data="rep_status_refresh")]])
+        )
+    except Exception:
+        pass  # لا تغيير في المحتوى منذ آخر تحديث، تجاهل خطأ "Message is not modified"
+
 
 async def payments_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_timeout(update, context):
@@ -2522,7 +2816,7 @@ async def msg_send_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     body = context.user_data.pop("msg_body", "")
     photo = context.user_data.pop("msg_photo", None)
     text = f"📩 رسالة من الإدارة\n\n{body}" if body else "📩 رسالة من الإدارة"
-    sent = 0
+    delivered, failed, no_account = [], [], []
 
     async def _send(telegram_id):
         if photo:
@@ -2533,23 +2827,40 @@ async def msg_send_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     if target.get("type") == "all":
         reps = list_users_by_role("representative", active_only=True)
         for r in reps:
-            if r["telegram_id"]:
-                try:
-                    await _send(r["telegram_id"])
-                    sent += 1
-                except Exception:
-                    pass
+            if not r["telegram_id"]:
+                no_account.append(r["name"])
+                continue
+            try:
+                await _send(r["telegram_id"])
+                delivered.append(r["name"])
+            except Exception:
+                failed.append(r["name"])
         log_message(session["id"], None, "all", body)
     else:
         rep = get_user(target.get("id"))
-        if rep and rep["telegram_id"]:
-            try:
-                await _send(rep["telegram_id"])
-                sent += 1
-            except Exception:
-                pass
+        if rep:
+            if not rep["telegram_id"]:
+                no_account.append(rep["name"])
+            else:
+                try:
+                    await _send(rep["telegram_id"])
+                    delivered.append(rep["name"])
+                except Exception:
+                    failed.append(rep["name"])
         log_message(session["id"], target.get("id"), "single", body)
-    await query.edit_message_text(f"✅ تم إرسال الرسالة ({sent} مستلم).")
+
+    lines = [f"✅ تم تسليم الرسالة إلى تيليجرام لـ {len(delivered)} حساب."]
+    if delivered:
+        lines.append("📬 وصلت إلى: " + "، ".join(delivered))
+    if failed:
+        lines.append("⚠️ فشل الإرسال لـ (على الأغلب أوقف المستخدم البوت): " + "، ".join(failed))
+    if no_account:
+        lines.append("🚫 لم يسجّلوا الدخول عبر البوت بعد فلا يوجد حساب تيليجرام مرتبط: " + "، ".join(no_account))
+    lines.append(
+        "\nℹ️ ملاحظة: تيليجرام لا يسمح لأي بوت بمعرفة هل قرأ المستخدم الرسالة فعلاً أم لا "
+        "(لا توجد علامة \"تمت القراءة\" للبوتات) — \"تم التسليم\" هنا يعني وصلت لحساب تيليجرام الخاص به بنجاح."
+    )
+    await query.edit_message_text("\n".join(lines))
     await send_main_menu(query, context)
 
 
@@ -2697,6 +3008,12 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await msg_start(update, context)
     if text == "📢 إبلاغ/فكرة تطوير":
         return await feedback_start(update, context)
+    if text == "📶 حالة المندوبين":
+        return await rep_status_menu(update, context)
+    if text == "🏠 Home Use target":
+        return await home_use_target_menu(update, context)
+    if text == "🩺 Professional Use target":
+        return await professional_use_target_menu(update, context)
 
     await update.message.reply_text("الرجاء استخدام الأزرار في القائمة.", reply_markup=main_menu_kb(session))
     return MAIN_MENU
@@ -2758,10 +3075,14 @@ def build_app():
                 CallbackQueryHandler(export_rep_report_pdf_cb, pattern="^export_rep_report_pdf$"),
                 CallbackQueryHandler(rep_view_cb, pattern="^rep_view:"),
                 CallbackQueryHandler(rep_toggle_cb, pattern="^rep_toggle:"),
+                CallbackQueryHandler(rep_setcat_cb, pattern="^rep_setcat:"),
                 CallbackQueryHandler(rep_delete_confirm_cb, pattern="^rep_delete_confirm:"),
                 CallbackQueryHandler(rep_delete_do_cb, pattern="^rep_delete_do:"),
                 CallbackQueryHandler(rep_editname_cb, pattern="^rep_editname:"),
                 CallbackQueryHandler(rep_editpass_cb, pattern="^rep_editpass:"),
+                CallbackQueryHandler(admin_self_view_cb, pattern="^admin_self_view$"),
+                CallbackQueryHandler(admin_self_editname_cb, pattern="^admin_self_editname$"),
+                CallbackQueryHandler(admin_self_editpass_cb, pattern="^admin_self_editpass$"),
                 CallbackQueryHandler(assist_view_cb, pattern="^assist_view:"),
                 CallbackQueryHandler(assist_toggle_cb, pattern="^assist_toggle:"),
                 CallbackQueryHandler(assist_delete_confirm_cb, pattern="^assist_delete_confirm:"),
@@ -2796,6 +3117,10 @@ def build_app():
                 CallbackQueryHandler(msg_send_confirm_cb, pattern="^msg_send_confirm$"),
                 CallbackQueryHandler(msg_send_cancel_cb, pattern="^msg_send_cancel$"),
                 CallbackQueryHandler(feedback_reply_cb, pattern="^feedback_reply:"),
+                CallbackQueryHandler(rep_status_refresh_cb, pattern="^rep_status_refresh$"),
+                CallbackQueryHandler(cattarget_set_cb, pattern="^cattarget_set:"),
+                CallbackQueryHandler(cattarget_delete_cb, pattern="^cattarget_delete:"),
+                CallbackQueryHandler(cattarget_delete_do_cb, pattern="^cattarget_delete_do:"),
                 CallbackQueryHandler(noop_cb, pattern="^noop$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router),
             ],
