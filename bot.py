@@ -934,7 +934,7 @@ LOGIN_KB = kb([["🔐 دخول"]])
 CANCEL_KB = kb([["❌ إلغاء الأمر"]])
 SKIP_CANCEL_KB = kb([["⏭️ تخطي"], ["❌ إلغاء الأمر"]])
 
-REP_MENU_ROWS = [["💰 التحصيل", "🔍 البحث عن عميل"], ["📊 تقرير السدادات"], ["📢 إبلاغ/فكرة تطوير"], ["❌ إلغاء الأمر", "🚪 خروج"]]
+REP_MENU_ROWS = [["💰 التحصيل", "🔍 البحث عن عميل"], ["📊 تقرير السدادات"], ["🏦 حسابات شركة الحياة فارما"], ["📢 إبلاغ/فكرة تطوير"], ["❌ إلغاء الأمر", "🚪 خروج"]]
 
 ADMIN_MENU_ROWS = [
     ["💰 التحصيل", "👥 المندوبين"],
@@ -943,6 +943,7 @@ ADMIN_MENU_ROWS = [
     ["📊 التقارير", "📩 إرسال رسالة"],
     ["📶 حالة المندوبين"],
     ["🏠 Home Use target", "🩺 Professional Use target"],
+    ["🏦 حسابات شركة الحياة فارما"],
     ["📢 إبلاغ/فكرة تطوير"],
     ["❌ إلغاء الأمر", "🚪 خروج"],
 ]
@@ -989,6 +990,7 @@ def main_menu_kb(session):
         cat_row.append("🩺 Professional Use target")
     if cat_row:
         rows.append(cat_row)
+    rows.append(["🏦 حسابات شركة الحياة فارما"])
     rows.append(["📢 إبلاغ/فكرة تطوير"])
     rows.append(["❌ إلغاء الأمر", "🚪 خروج"])
     return kb(rows)
@@ -1173,20 +1175,20 @@ def format_last_seen(last_seen_str):
     """يعرض آخر وقت تفاعل فيه المستخدم مع البوت (أقرب بديل ممكن لحالة أونلاين/أوفلاين،
     لأن تيليجرام لا يمنح البوتات صلاحية معرفة حالة الاتصال الفعلية لأي مستخدم)."""
     if not last_seen_str:
-        return "لم يسجّل الدخول عبر البوت بعد"
+        return "🛑 لم يسجّل الدخول عبر البوت بعد"
     try:
         last_seen = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
     except Exception:
-        return last_seen_str
+        return f"🛑 {last_seen_str}"
     delta = datetime.now() - last_seen
     seconds = delta.total_seconds()
-    if seconds < 120:
-        return "🟢 نشط الآن تقريباً (قبل أقل من دقيقتين)"
+    if seconds < 300:
+        return "🟢 متصل (نشاط قبل أقل من 5 دقائق)"
     if seconds < 3600:
-        return f"🟡 آخر نشاط: منذ {int(seconds // 60)} دقيقة"
+        return f"🟠 آخر نشاط: منذ {int(seconds // 60)} دقيقة"
     if seconds < 86400:
-        return f"⚪ آخر نشاط: منذ {int(seconds // 3600)} ساعة"
-    return f"⚪ آخر نشاط: منذ {int(seconds // 86400)} يوم"
+        return f"🛑 آخر نشاط: منذ {int(seconds // 3600)} ساعة"
+    return f"🛑 آخر نشاط: منذ {int(seconds // 86400)} يوم"
 
 
 def current_month_target_progress(rep_id, month=None, year=None):
@@ -2312,14 +2314,42 @@ async def cattarget_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text(f"🗑️ تم حذف هدف {CATEGORY_LABELS[category]} لشهر {month}-{year}.")
 
 
+async def company_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_timeout(update, context):
+        return LOGIN_USERNAME
+    text = (
+        "🏦 <b>حسابات شركة الحياة فارما</b>\n"
+        "ℹ️ بمجرد النقر على رقم الحساب سيتم النسخ أوتوماتيك\n\n"
+        "🏛️ <b>مصرف التجارة والتنمية</b> (يدعم شبكة الدفع الفوري والدولي LYpay)\n"
+        "رقم الحساب المحلي (اضغط للنسخ):\n"
+        "<code>0012793913001</code>\n"
+        "رقم الآيبان الدولي (اضغط للنسخ):\n"
+        "<code>LY33010012000012793913001</code>\n\n"
+        "🏛️ <b>مصرف الوحدة</b>\n"
+        "رقم الحساب (اضغط للنسخ):\n"
+        "<code>601022300980014</code>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await send_main_menu(update, context)
+    return MAIN_MENU
+
+
 def build_rep_status_text():
     reps = list_users_by_role("representative")
+    assistants = list_users_by_role("assistant")
+    lines = ["📶 حالة المندوبين والمساعدين:\n"]
+    lines.append("👥 المندوبون:")
     if not reps:
-        return "لا يوجد مندوبون مسجّلون بعد."
-    lines = ["📶 حالة المندوبين:\n"]
+        lines.append("لا يوجد مندوبون مسجّلون بعد.")
     for r in reps:
         status_tag = "" if r["active"] else " (⛔ موقوف)"
-        lines.append(f"👤 {r['name']}{status_tag}\n{format_last_seen(r['last_seen'])}\n")
+        lines.append(f"👤 {r['name']}{status_tag}\n{format_last_seen(r['last_seen'])}")
+    lines.append("\n👨‍💼 المساعدون:")
+    if not assistants:
+        lines.append("لا يوجد مساعدون مسجّلون بعد.")
+    for a in assistants:
+        status_tag = "" if a["active"] else " (⛔ موقوف)"
+        lines.append(f"👤 {a['name']}{status_tag}\n{format_last_seen(a['last_seen'])}")
     return "\n".join(lines)
 
 
@@ -3077,6 +3107,8 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await home_use_target_menu(update, context)
     if text == "🩺 Professional Use target":
         return await professional_use_target_menu(update, context)
+    if text == "🏦 حسابات شركة الحياة فارما":
+        return await company_accounts_menu(update, context)
 
     await update.message.reply_text("الرجاء استخدام الأزرار في القائمة.", reply_markup=main_menu_kb(session))
     return MAIN_MENU
