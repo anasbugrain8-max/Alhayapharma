@@ -616,9 +616,15 @@ def generate_rep_report_pdf(rep_name, rows, out_path, period_label="", target_in
         target, collected, remaining, pct = target_info
         if target:
             pdf.ln(1)
-            pdf._font("B", 12)
             pdf.set_fill_color(230, 245, 245)
-            pdf.cell(0, 8, ar(f"الهدف الشهري: {target:,.2f} د.ل   |   المحصل: {collected:,.2f} د.ل ({pct:.1f}%)   |   المتبقي: {remaining:,.2f} د.ل"), align="R", fill=True)
+            pdf._font("B", 11)
+            pdf.cell(0, 7, ar(f"الهدف الشهري: {target:,.2f} د.ل"), align="R", fill=True)
+            pdf.ln(7)
+            pdf.cell(0, 7, ar(f"المحصل: {collected:,.2f} د.ل"), align="R", fill=True)
+            pdf.ln(7)
+            pdf.cell(0, 7, ar(f"نسبة الإنجاز: {pct:.1f} بالمئة"), align="R", fill=True)
+            pdf.ln(7)
+            pdf.cell(0, 7, ar(f"المتبقي: {remaining:,.2f} د.ل"), align="R", fill=True)
             pdf.ln(9)
     pdf.ln(2)
     headers = ["طريقة السداد", "قيمة السداد", "تاريخ السداد", "اسم العميل"]
@@ -1008,7 +1014,7 @@ async def admin_setup_password(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def login_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if text == "🔐 دخول":
+    if "دخول" in text:
         await update.message.reply_text("🔑 الرقم السري:", reply_markup=CANCEL_KB)
         return LOGIN_PASSWORD
     await update.message.reply_text("اضغط على زر الدخول لتسجيل الدخول.", reply_markup=LOGIN_KB)
