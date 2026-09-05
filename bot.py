@@ -1382,8 +1382,8 @@ ADMIN_MENU_ROWS = [
     ["📊 التقارير", "📩 إرسال رسالة"],
     ["📶 حالة المندوبين"],
     ["🏠 Home Use target", "🩺 Professional Use target"],
-    ["💵 مصاريف"],
-    ["💼 الرواتب"],
+    ["💵 مصروفات"],
+    ["💼 صرف الرواتب الثابتة", "📊 مندوبي العمولة"],
     ["🏦 حسابات شركة الحياة فارما"],
     ["📢 إبلاغ/فكرة تطوير"],
     ["❌ إلغاء الأمر", "🚪 خروج"],
@@ -1432,9 +1432,9 @@ def main_menu_kb(session):
     if cat_row:
         rows.append(cat_row)
     if perms.get("manage_expenses"):
-        rows.append(["💵 مصاريف"])
+        rows.append(["💵 مصروفات"])
     if perms.get("manage_payroll"):
-        rows.append(["💼 الرواتب"])
+        rows.append(["💼 صرف الرواتب الثابتة", "📊 مندوبي العمولة"])
     rows.append(["🏦 حسابات شركة الحياة فارما"])
     rows.append(["📢 إبلاغ/فكرة تطوير"])
     rows.append(["❌ إلغاء الأمر", "🚪 خروج"])
@@ -1536,6 +1536,31 @@ async def keypad_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 suffix = " د.ل" if emp["emp_type"] == "fixed" else "%"
                 await query.edit_message_text(f"✅ تم تحديث {label} لـ {emp['name']}: {amount:g}{suffix}")
             await send_main_menu(query, context)
+            return MAIN_MENU
+        elif target and target.startswith("expense_edit_amt:"):
+            expense_id = int(target.split(":")[1])
+            update_expense_amount(expense_id, amount)
+            await query.edit_message_text(f"✅ تم تحديث قيمة المصروف إلى: {amount:,.2f} د.ل")
+            await send_main_menu(query, context)
+            return MAIN_MENU
+        elif target and target.startswith("fixed_bonus:"):
+            employee_id = int(target.split(":")[1])
+            pay = context.user_data.get("fixed_pay", {})
+            pay["bonus"] = amount
+            context.user_data["fixed_pay"] = pay
+            emp = get_payroll_employee(employee_id)
+            gross = (emp["fixed_amount"] or 0) + amount
+            text = (
+                f"صرف راتب {emp['name']} — شهر {pay.get('month')}-{pay.get('year')}\n\n"
+                f"الراتب الثابت: {emp['fixed_amount']:,.2f} د.ل\n"
+                f"🎁 مكافأة إضافية: {amount:,.2f} د.ل\n"
+                f"الصافي المستحق للصرف: {gross:,.2f} د.ل"
+            )
+            buttons = [
+                [InlineKeyboardButton("➕ تعديل المكافأة", callback_data=f"fixed_addbonus:{employee_id}")],
+                [InlineKeyboardButton("✅ تأكيد الصرف", callback_data="fixed_pay_confirm"), InlineKeyboardButton("❌ إلغاء", callback_data="fixed_pay_cancel")],
+            ]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
             return MAIN_MENU
         return None
 
@@ -2709,6 +2734,31 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ تم تحديث {label} لـ {emp['name']}: {amount:g}{suffix}")
         await send_main_menu(update, context)
         return MAIN_MENU
+    if target and target.startswith("expense_edit_amt:"):
+        expense_id = int(target.split(":")[1])
+        update_expense_amount(expense_id, amount)
+        await update.message.reply_text(f"✅ تم تحديث قيمة المصروف إلى: {amount:,.2f} د.ل")
+        await send_main_menu(update, context)
+        return MAIN_MENU
+    if target and target.startswith("fixed_bonus:"):
+        employee_id = int(target.split(":")[1])
+        pay = context.user_data.get("fixed_pay", {})
+        pay["bonus"] = amount
+        context.user_data["fixed_pay"] = pay
+        emp = get_payroll_employee(employee_id)
+        gross = (emp["fixed_amount"] or 0) + amount
+        text = (
+            f"صرف راتب {emp['name']} — شهر {pay.get('month')}-{pay.get('year')}\n\n"
+            f"الراتب الثابت: {emp['fixed_amount']:,.2f} د.ل\n"
+            f"🎁 مكافأة إضافية: {amount:,.2f} د.ل\n"
+            f"الصافي المستحق للصرف: {gross:,.2f} د.ل"
+        )
+        buttons = [
+            [InlineKeyboardButton("➕ تعديل المكافأة", callback_data=f"fixed_addbonus:{employee_id}")],
+            [InlineKeyboardButton("✅ تأكيد الصرف", callback_data="fixed_pay_confirm"), InlineKeyboardButton("❌ إلغاء", callback_data="fixed_pay_cancel")],
+        ]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        return MAIN_MENU
     rep_id = context.user_data.pop("target_rep_id", None)
     if rep_id:
         m, y = month_year_now()
@@ -2830,11 +2880,42 @@ async def cattarget_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ============================================================
-# ADMIN / ASSISTANT: expenses (💵 مصاريف)
+# ADMIN / ASSISTANT: مصروفات (بسيطة — 3 خطوات: قسم، قيمة، بيان)
 # ============================================================
 
-def expense_attribution_name(user_row):
-    return user_row["name"]
+def update_expense_department(expense_id, name):
+    conn = get_db()
+    conn.execute("UPDATE expenses SET attribution_type='department', attribution_id=NULL, attribution_name=? WHERE id=?", (name, expense_id))
+    conn.commit()
+    conn.close()
+
+
+def update_expense_description(expense_id, description):
+    conn = get_db()
+    conn.execute("UPDATE expenses SET description=? WHERE id=?", (description, expense_id))
+    conn.commit()
+    conn.close()
+
+
+def update_expense_amount(expense_id, amount):
+    conn = get_db()
+    conn.execute("UPDATE expenses SET amount=? WHERE id=?", (amount, expense_id))
+    conn.commit()
+    conn.close()
+
+
+def update_expense_date(expense_id, date_str):
+    conn = get_db()
+    conn.execute("UPDATE expenses SET expense_date=? WHERE id=?", (date_str, expense_id))
+    conn.commit()
+    conn.close()
+
+
+def get_expense(expense_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM expenses WHERE id=?", (expense_id,)).fetchone()
+    conn.close()
+    return row
 
 
 async def expenses_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2844,11 +2925,14 @@ async def expenses_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if session["role"] != "admin" and not user_has_permission(session, "manage_expenses"):
         await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
         return MAIN_MENU
-    buttons = [
-        [InlineKeyboardButton("➕ إضافة مصروف", callback_data="expense_add_start")],
-        [InlineKeyboardButton("📊 تقرير المصاريف", callback_data="expense_report_menu")],
-    ]
-    await update.message.reply_text("💵 المصاريف:", reply_markup=InlineKeyboardMarkup(buttons))
+    recent = get_expenses()[:10]
+    buttons = [[InlineKeyboardButton("➕ إضافة مصروف", callback_data="expense_add_start")]]
+    for r in recent:
+        buttons.append([InlineKeyboardButton(f"{r['expense_date']} | {r['amount']:,.0f} د.ل | {r['attribution_name']}", callback_data=f"expense_view:{r['id']}")])
+    if get_expenses():
+        buttons.append([InlineKeyboardButton("📊 تقرير المصروفات الكامل", callback_data="expense_report")])
+    text = "💵 المصروفات:" if recent else "💵 المصروفات:\n\nلا توجد مصروفات مسجّلة بعد."
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     return MAIN_MENU
 
 
@@ -2856,357 +2940,216 @@ async def expense_add_start_cb(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     context.user_data["expense"] = {}
+    buttons = [[InlineKeyboardButton(d, callback_data=f"expense_pickdept:{i}")] for i, d in enumerate(EXPENSE_DEPARTMENTS)]
+    await query.edit_message_text("① اختر القسم:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def expense_pickdept_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    dept = EXPENSE_DEPARTMENTS[int(query.data.split(":")[1])]
+    context.user_data.setdefault("expense", {})["department"] = dept
     context.user_data["kp_target"] = "expense_amount"
     context.user_data["kp_value"] = ""
-    await query.edit_message_text("➕ إضافة مصروف جديد")
-    await query.message.reply_text(
-        "أدخل قيمة المصروف باستخدام لوحة الأرقام:\n\nالقيمة الحالية: 0",
-        reply_markup=build_keypad_kb(""),
-    )
+    await query.edit_message_text(f"القسم: {dept}")
+    await query.message.reply_text("② أدخل قيمة المصروف:\n\nالقيمة الحالية: 0", reply_markup=build_keypad_kb(""))
     return TARGET_AMOUNT
 
 
 async def expense_desc_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault("expense", {})["description"] = update.message.text.strip()
-    now = datetime.now()
-    await update.message.reply_text(
-        "📅 اختر تاريخ المصروف (أو اكتبه يدوياً بصيغة YYYY-MM-DD):",
-        reply_markup=build_calendar_kb(now.year, now.month, prefix="expdate"),
-    )
-    return EXPENSE_FLOW
-
-
-def expense_attribution_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 خاص بمندوب", callback_data="expattr:representative")],
-        [InlineKeyboardButton("👨‍💼 خاص بالإدارة/مساعد", callback_data="expattr:assistant")],
-        [InlineKeyboardButton("🏢 مصروف عام للشركة", callback_data="expattr:department")],
-        [InlineKeyboardButton("🎁 مكافأة", callback_data="expattr:bonus")],
-    ])
-
-
-async def expdate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    parts = query.data.split(":")
-    if parts[1] == "nav":
-        await query.answer()
-        y, m = int(parts[2]), int(parts[3])
-        await query.edit_message_reply_markup(reply_markup=build_calendar_kb(y, m, prefix="expdate"))
-        return EXPENSE_FLOW
-    await query.answer()
-    if parts[1] == "today":
-        date_str = datetime.now().strftime("%Y-%m-%d")
-    else:
-        y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
-        date_str = f"{y:04d}-{m:02d}-{d:02d}"
-    context.user_data.setdefault("expense", {})["date"] = date_str
-    await query.edit_message_text(f"📅 تاريخ المصروف: {date_str}\n\nهذا المصروف يخص:", reply_markup=expense_attribution_kb())
-    return EXPENSE_FLOW
-
-
-async def expense_date_text_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    editing_id = context.user_data.pop("editing_expense_id", None)
     text = update.message.text.strip()
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", text):
-        await update.message.reply_text("⚠️ صيغة التاريخ غير صحيحة. استخدم YYYY-MM-DD أو اختر من التقويم أعلاه:")
-        return EXPENSE_FLOW
-    context.user_data.setdefault("expense", {})["date"] = text
-    await update.message.reply_text(f"📅 تاريخ المصروف: {text}\n\nهذا المصروف يخص:", reply_markup=expense_attribution_kb())
-    return EXPENSE_FLOW
-
-
-async def expattr_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    attr_type = query.data.split(":")[1]
-    if attr_type == "representative":
-        reps = list_users_by_role("representative", active_only=True)
-        if not reps:
-            await query.edit_message_text("لا يوجد مندوبون نشطون حالياً.")
-            return EXPENSE_FLOW
-        buttons = [[InlineKeyboardButton(r["name"], callback_data=f"expattrpick:representative:{r['id']}")] for r in reps]
-        await query.edit_message_text("اختر المندوب:", reply_markup=InlineKeyboardMarkup(buttons))
-    elif attr_type == "assistant":
-        session = session_of(context)
-        assistants = list_users_by_role("assistant", active_only=True)
-        admin_row = get_user(session["id"]) if session["role"] == "admin" else None
-        buttons = []
-        if admin_row:
-            buttons.append([InlineKeyboardButton(f"👑 {admin_row['name']} (المدير)", callback_data=f"expattrpick:assistant:{admin_row['id']}")])
-        buttons += [[InlineKeyboardButton(a["name"], callback_data=f"expattrpick:assistant:{a['id']}")] for a in assistants]
-        if not buttons:
-            await query.edit_message_text("لا يوجد مساعدون نشطون حالياً.")
-            return EXPENSE_FLOW
-        await query.edit_message_text("اختر الشخص المسؤول (إدارة/مساعد):", reply_markup=InlineKeyboardMarkup(buttons))
-    elif attr_type == "department":
-        buttons = [[InlineKeyboardButton(d, callback_data=f"expattrpick:department:{i}")] for i, d in enumerate(EXPENSE_DEPARTMENTS)]
-        await query.edit_message_text("اختر القسم:", reply_markup=InlineKeyboardMarkup(buttons))
-    else:  # bonus
-        buttons = [[InlineKeyboardButton(label, callback_data=f"expattrpick:bonus:{key}")] for key, label in CLASSIFICATION_LABELS.items()]
-        await query.edit_message_text("🎁 هذه المكافأة لفئة:", reply_markup=InlineKeyboardMarkup(buttons))
-    return EXPENSE_FLOW
-
-
-async def expattrpick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, attr_type, value = query.data.split(":")
-    expense = context.user_data.setdefault("expense", {})
-    if attr_type == "department":
-        name = EXPENSE_DEPARTMENTS[int(value)]
-        expense["attribution_type"] = "department"
-        expense["attribution_id"] = None
-        expense["attribution_name"] = name
-    elif attr_type == "bonus":
-        name = CLASSIFICATION_LABELS[value]
-        expense["attribution_type"] = "bonus"
-        expense["attribution_id"] = None
-        expense["attribution_name"] = f"🎁 مكافأة - {name}"
-    else:
-        user_row = get_user(int(value))
-        expense["attribution_type"] = attr_type
-        expense["attribution_id"] = user_row["id"]
-        expense["attribution_name"] = user_row["name"]
-    summary = (
-        "يرجى تأكيد بيانات المصروف:\n\n"
-        f"💵 القيمة: {expense['amount']:,.2f} د.ل\n"
-        f"📝 البيان: {expense['description']}\n"
-        f"📅 التاريخ: {expense['date']}\n"
-        f"🏷️ الفئة: {expense['attribution_name']}"
-    )
-    await query.edit_message_text(summary, reply_markup=yesno_kb("expense_save", "expense_cancel", "💾 حفظ المصروف", "❌ إلغاء"))
-    return EXPENSE_FLOW
-
-
-async def expense_save_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    session = session_of(context)
-    expense = context.user_data.pop("expense", {})
-    if query.data == "expense_cancel" or not expense:
-        await query.edit_message_text("تم الإلغاء.")
-        await send_main_menu(query, context)
+    if editing_id:
+        update_expense_description(editing_id, text)
+        await update.message.reply_text("✅ تم تحديث البيان.")
+        await send_main_menu(update, context)
         return MAIN_MENU
-    add_expense(
-        expense["amount"], expense["description"], expense["date"],
-        expense["attribution_type"], expense.get("attribution_id"), expense["attribution_name"],
-        session["id"],
-    )
-    await query.edit_message_text(
+    expense = context.user_data.pop("expense", {})
+    expense["description"] = text
+    today = datetime.now().strftime("%Y-%m-%d")
+    eid = add_expense(expense["amount"], expense["description"], today, "department", None, expense["department"], session_of(context)["id"])
+    await update.message.reply_text(
         "✅ تم تسجيل المصروف بنجاح\n\n"
+        f"🏷️ القسم: {expense['department']}\n"
         f"💵 القيمة: {expense['amount']:,.2f} د.ل\n"
         f"📝 البيان: {expense['description']}\n"
-        f"📅 التاريخ: {expense['date']}\n"
-        f"🏷️ الفئة: {expense['attribution_name']}"
+        f"📅 التاريخ: {today} (تلقائي — اليوم)",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗓️ تغيير التاريخ", callback_data=f"expense_editdate:{eid}")]]),
     )
-    await query.message.reply_text("العملية التالية:", reply_markup=main_menu_kb(session))
+    await send_main_menu(update, context)
     return MAIN_MENU
 
 
-async def expense_report_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def expense_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    expense_id = int(query.data.split(":")[1])
+    e = get_expense(expense_id)
+    if not e:
+        await query.edit_message_text("هذا المصروف لم يعد موجوداً.")
+        return
+    text = (
+        f"🏷️ القسم: {e['attribution_name']}\n"
+        f"💵 القيمة: {e['amount']:,.2f} د.ل\n"
+        f"📝 البيان: {e['description']}\n"
+        f"📅 التاريخ: {e['expense_date']}"
+    )
     buttons = [
-        [InlineKeyboardButton("📋 كل المصاريف", callback_data="expreport:all")],
-        [InlineKeyboardButton("👤 حسب مندوب", callback_data="expreport:representative")],
-        [InlineKeyboardButton("👨‍💼 حسب مساعد/إدارة", callback_data="expreport:assistant")],
-        [InlineKeyboardButton("🏢 حسب قسم", callback_data="expreport:department")],
-        [InlineKeyboardButton("🎁 حسب مكافآت", callback_data="expreport:bonus")],
-        [InlineKeyboardButton("📅 حسب شهر", callback_data="expreport:month")],
+        [InlineKeyboardButton("✏️ تعديل القسم", callback_data=f"expense_editdept:{expense_id}")],
+        [InlineKeyboardButton("✏️ تعديل القيمة", callback_data=f"expense_editamt:{expense_id}")],
+        [InlineKeyboardButton("✏️ تعديل البيان", callback_data=f"expense_editdesc:{expense_id}")],
+        [InlineKeyboardButton("🗓️ تعديل التاريخ", callback_data=f"expense_editdate:{expense_id}")],
+        [InlineKeyboardButton("🗑️ حذف المصروف", callback_data=f"expense_delete_confirm:{expense_id}")],
     ]
-    await query.edit_message_text("📊 تقرير المصاريف — اختر التصفية:", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def expense_editdept_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    expense_id = int(query.data.split(":")[1])
+    buttons = [[InlineKeyboardButton(d, callback_data=f"expense_setdept:{expense_id}:{i}")] for i, d in enumerate(EXPENSE_DEPARTMENTS)]
+    await query.edit_message_text("اختر القسم الجديد:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def expense_setdept_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("تم التحديث")
+    _, expense_id, idx = query.data.split(":")
+    dept = EXPENSE_DEPARTMENTS[int(idx)]
+    update_expense_department(int(expense_id), dept)
+    await query.edit_message_text(f"✅ تم تحديث القسم إلى: {dept}")
+
+
+async def expense_editamt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    expense_id = int(query.data.split(":")[1])
+    context.user_data["kp_target"] = f"expense_edit_amt:{expense_id}"
+    context.user_data["kp_value"] = ""
+    await query.message.reply_text("أدخل القيمة الجديدة:\n\nالقيمة الحالية: 0", reply_markup=build_keypad_kb(""))
+    return TARGET_AMOUNT
+
+
+async def expense_editdesc_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    expense_id = int(query.data.split(":")[1])
+    context.user_data["editing_expense_id"] = expense_id
+    await query.message.reply_text("أدخل البيان الجديد:", reply_markup=CANCEL_KB)
+    return EXPENSE_DESC
+
+
+async def expense_editdate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    expense_id = int(query.data.split(":")[1])
+    now = datetime.now()
+    await query.message.reply_text(
+        "اختر التاريخ الجديد:",
+        reply_markup=build_calendar_kb(now.year, now.month, prefix=f"expeditdate:{expense_id}"),
+    )
+
+
+async def expeditdate_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")  # expeditdate : expense_id : nav/day/today : ...
+    expense_id = int(parts[1])
+    action = parts[2]
+    if action == "nav":
+        await query.answer()
+        y, m = int(parts[3]), int(parts[4])
+        await query.edit_message_reply_markup(reply_markup=build_calendar_kb(y, m, prefix=f"expeditdate:{expense_id}"))
+        return
+    await query.answer("تم التحديث")
+    if action == "today":
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    else:
+        y, m, d = int(parts[3]), int(parts[4]), int(parts[5])
+        date_str = f"{y:04d}-{m:02d}-{d:02d}"
+    update_expense_date(expense_id, date_str)
+    await query.edit_message_text(f"✅ تم تحديث التاريخ إلى: {date_str}")
+
+
+async def expense_delete_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    expense_id = int(query.data.split(":")[1])
+    await query.edit_message_text(
+        "⚠️ هل تريد حذف هذا المصروف؟",
+        reply_markup=yesno_kb(f"expense_delete_do:{expense_id}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
+    )
+
+
+async def expense_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("تم الحذف")
+    expense_id = int(query.data.split(":")[1])
+    delete_expense(expense_id)
+    await query.edit_message_text("🗑️ تم حذف المصروف بنجاح.")
+
+
+async def expense_report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    rows = get_expenses()
+    text = show_expense_report(rows, "كل المصروفات")
+    context.user_data["last_report"] = ("expenses", rows, "كل المصروفات", None)
+    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
 
 def show_expense_report(rows, label):
     total = get_total_expenses(rows)
-    lines = [f"📊 تقرير المصاريف — {label}\n"]
+    lines = [f"📊 تقرير المصروفات — {label}\n"]
     for r in rows[:30]:
-        lines.append(f"• {r['expense_date']} | {r['amount']:,.2f} د.ل | {r['description']} | {r['attribution_name'] or '-'}")
+        lines.append(f"• {r['expense_date']} | {r['amount']:,.2f} د.ل | {r['description']} | {r['attribution_name']}")
     if len(rows) > 30:
         lines.append(f"... و {len(rows)-30} عملية أخرى")
-    lines.append(f"\nإجمالي المصاريف: {total:,.2f} د.ل")
+    lines.append(f"\nإجمالي المصروفات: {total:,.2f} د.ل")
     return "\n".join(lines)
 
 
-async def expreport_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    session = session_of(context)
-    kind = query.data.split(":")[1]
-    if kind == "all":
-        rows = get_expenses()
-        text = show_expense_report(rows, "كل المصاريف")
-        context.user_data["last_report"] = ("expenses", rows, "كل المصاريف", None)
-        buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-    elif kind == "representative":
-        reps = list_users_by_role("representative")
-        buttons = [[InlineKeyboardButton(r["name"], callback_data=f"expreportpick:representative:{r['id']}")] for r in reps]
-        await query.edit_message_text("اختر المندوب:", reply_markup=InlineKeyboardMarkup(buttons))
-    elif kind == "assistant":
-        assistants = list_users_by_role("assistant")
-        admin_row = get_user(session["id"]) if session["role"] == "admin" else None
-        buttons = []
-        if admin_row:
-            buttons.append([InlineKeyboardButton(f"👑 {admin_row['name']} (المدير)", callback_data=f"expreportpick:assistant:{admin_row['id']}")])
-        buttons += [[InlineKeyboardButton(a["name"], callback_data=f"expreportpick:assistant:{a['id']}")] for a in assistants]
-        await query.edit_message_text("اختر الشخص:", reply_markup=InlineKeyboardMarkup(buttons))
-    elif kind == "department":
-        buttons = [[InlineKeyboardButton(d, callback_data=f"expreportpick:department:{i}")] for i, d in enumerate(EXPENSE_DEPARTMENTS)]
-        await query.edit_message_text("اختر القسم:", reply_markup=InlineKeyboardMarkup(buttons))
-    elif kind == "bonus":
-        buttons = [[InlineKeyboardButton(label, callback_data=f"expreportpick:bonus:{key}")] for key, label in CLASSIFICATION_LABELS.items()]
-        await query.edit_message_text("اختر الفئة:", reply_markup=InlineKeyboardMarkup(buttons))
-    elif kind == "month":
-        now = datetime.now()
-        await query.edit_message_text("📅 اختر الشهر (بالأرقام):", reply_markup=month_number_kb("expmonth", now.year))
-
-
-async def expreportpick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    session = session_of(context)
-    _, attr_type, value = query.data.split(":")
-    if attr_type == "department":
-        name = EXPENSE_DEPARTMENTS[int(value)]
-        rows = get_expenses(attribution_type="department", attribution_name=name)
-        label = name
-    elif attr_type == "bonus":
-        name = f"🎁 مكافأة - {CLASSIFICATION_LABELS[value]}"
-        rows = get_expenses(attribution_type="bonus", attribution_name=name)
-        label = name
-    else:
-        user_row = get_user(int(value))
-        rows = get_expenses(attribution_type=attr_type, attribution_id=user_row["id"])
-        label = user_row["name"]
-    text = show_expense_report(rows, label)
-    context.user_data["last_report"] = ("expenses", rows, label, None)
-    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-
-
-async def expmonth_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    session = session_of(context)
-    parts = query.data.split(":")
-    if parts[1] == "nav":
-        year = int(parts[2])
-        await query.edit_message_reply_markup(reply_markup=month_number_kb("expmonth", year))
-        return
-    year, month = int(parts[2]), int(parts[3])
-    rows = get_expenses(month=month, year=year)
-    label = f"شهر {month}-{year}"
-    text = show_expense_report(rows, label)
-    context.user_data["last_report"] = ("expenses", rows, label, None)
-    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-
-
 # ============================================================
-# ADMIN / ASSISTANT: payroll (💼 الرواتب)
+# ADMIN / ASSISTANT: صرف الرواتب الثابتة (بسيطة)
 # ============================================================
 
-EMP_TYPE_LABELS = {"fixed": "🔒 راتب ثابت", "commission": "📊 عمولة على التحصيل"}
-
-
-async def payroll_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fixed_salaries_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_timeout(update, context):
         return LOGIN_USERNAME
     session = session_of(context)
     if session["role"] != "admin" and not user_has_permission(session, "manage_payroll"):
         await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
         return MAIN_MENU
-    buttons = [
-        [InlineKeyboardButton("➕ إضافة موظف جديد", callback_data="payroll_add_start")],
-        [InlineKeyboardButton("📋 قائمة الموظفين / صرف راتب", callback_data="payroll_list")],
-        [InlineKeyboardButton("📊 تقرير الرواتب", callback_data="payroll_report")],
-    ]
-    await update.message.reply_text("💼 الرواتب:", reply_markup=InlineKeyboardMarkup(buttons))
+    employees = [e for e in list_payroll_employees() if e["emp_type"] == "fixed"]
+    buttons = [[InlineKeyboardButton("➕ إضافة موظف جديد", callback_data="fixed_add_start")]]
+    for e in employees:
+        buttons.append([InlineKeyboardButton(f"👤 {e['name']} — {e['fixed_amount']:,.0f} د.ل", callback_data=f"fixed_view:{e['id']}")])
+    if employees:
+        buttons.append([InlineKeyboardButton("📊 تقرير الرواتب الثابتة", callback_data="fixed_report")])
+    await update.message.reply_text("💼 صرف الرواتب الثابتة:", reply_markup=InlineKeyboardMarkup(buttons))
     return MAIN_MENU
 
 
-async def payroll_add_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fixed_add_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["payroll_new"] = {}
-    await query.edit_message_text("➕ إضافة موظف جديد")
-    await query.message.reply_text("أدخل اسم الموظف:", reply_markup=CANCEL_KB)
+    await query.edit_message_text("➕ إضافة موظف براتب ثابت")
+    await query.message.reply_text("① أدخل اسم الموظف:", reply_markup=CANCEL_KB)
     return PAYROLL_EMP_NAME
 
 
-async def payroll_emp_name_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fixed_name_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault("payroll_new", {})["name"] = update.message.text.strip()
-    buttons = [[InlineKeyboardButton(label, callback_data=f"payroll_class:{key}")] for key, label in CLASSIFICATION_LABELS.items()]
-    await update.message.reply_text("اختر تصنيف الموظف:", reply_markup=InlineKeyboardMarkup(buttons))
-    return PAYROLL_EMP_AMOUNT
-
-
-async def payroll_class_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    classification = query.data.split(":")[1]
-    context.user_data.setdefault("payroll_new", {})["classification"] = classification
-    buttons = [
-        [InlineKeyboardButton("🔒 راتب ثابت", callback_data="payroll_type:fixed")],
-        [InlineKeyboardButton("📊 عمولة على التحصيل", callback_data="payroll_type:commission")],
-    ]
-    await query.edit_message_text(f"التصنيف: {CLASSIFICATION_LABELS[classification]}\n\nاختر نوع الموظف:", reply_markup=InlineKeyboardMarkup(buttons))
-    return PAYROLL_EMP_AMOUNT
-
-
-async def payroll_type_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    emp_type = query.data.split(":")[1]
-    if emp_type == "fixed":
-        context.user_data["kp_target"] = "payroll_new_fixed"
-        context.user_data["kp_value"] = ""
-        await query.edit_message_text("🔒 راتب ثابت")
-        await query.message.reply_text(
-            "أدخل قيمة الراتب الشهري باستخدام لوحة الأرقام:\n\nالقيمة الحالية: 0",
-            reply_markup=build_keypad_kb(""),
-        )
-        return TARGET_AMOUNT
-    reps = list_users_by_role("representative", active_only=True)
-    if not reps:
-        await query.edit_message_text("لا يوجد مندوبون نشطون حالياً لربط العمولة بهم.")
-        return MAIN_MENU
-    buttons = [[InlineKeyboardButton(r["name"], callback_data=f"payroll_link_rep:{r['id']}")] for r in reps]
-    await query.edit_message_text("📊 عمولة على التحصيل\n\nاختر المندوب المرتبط بهذه العمولة:", reply_markup=InlineKeyboardMarkup(buttons))
-    return PAYROLL_EMP_AMOUNT
-
-
-async def payroll_link_rep_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    rep_id = int(query.data.split(":")[1])
-    rep = get_user(rep_id)
-    context.user_data.setdefault("payroll_new", {})["linked_rep_id"] = rep_id
-    context.user_data["kp_target"] = "payroll_new_rate"
+    context.user_data["kp_target"] = "payroll_new_fixed"
     context.user_data["kp_value"] = ""
-    await query.edit_message_text(f"المندوب المرتبط: {rep['name']}")
-    await query.message.reply_text(
-        "أدخل نسبة العمولة % باستخدام لوحة الأرقام (مثال: أدخل 5 لتعني 5%):\n\nالقيمة الحالية: 0",
-        reply_markup=build_keypad_kb(""),
-    )
+    await update.message.reply_text("② أدخل قيمة الراتب الشهري:\n\nالقيمة الحالية: 0", reply_markup=build_keypad_kb(""))
     return TARGET_AMOUNT
 
 
-async def payroll_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    employees = list_payroll_employees()
-    if not employees:
-        await query.edit_message_text("لا يوجد موظفون مسجّلون بعد. استخدم «➕ إضافة موظف جديد».")
-        return
-    buttons = [
-        [InlineKeyboardButton(f"{CLASSIFICATION_LABELS.get(e['classification'], '👤').split()[0]} {e['name']}", callback_data=f"payroll_view:{e['id']}")]
-        for e in employees
-    ]
-    await query.edit_message_text("📋 قائمة الموظفين:", reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def payroll_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fixed_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     employee_id = int(query.data.split(":")[1])
@@ -3214,44 +3157,26 @@ async def payroll_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not emp:
         await query.edit_message_text("هذا الموظف لم يعد موجوداً.")
         return
-    lines = [f"👤 {emp['name']}", f"التصنيف: {CLASSIFICATION_LABELS.get(emp['classification'], '-')}", f"النوع: {EMP_TYPE_LABELS[emp['emp_type']]}"]
-    if emp["emp_type"] == "fixed":
-        lines.append(f"الراتب الثابت: {emp['fixed_amount']:,.2f} د.ل")
-    else:
-        rep = get_user(emp["linked_rep_id"]) if emp["linked_rep_id"] else None
-        lines.append(f"نسبة العمولة: {emp['commission_rate']:g}%")
-        lines.append(f"المندوب المرتبط: {rep['name'] if rep else '-'}")
-        lines.append(f"الرصيد المحتجز (كنترول 1%): {emp['retained_balance']:,.2f} د.ل")
+    text = f"👤 {emp['name']}\nالراتب الثابت: {emp['fixed_amount']:,.2f} د.ل"
     buttons = [
-        [InlineKeyboardButton("💰 صرف راتب هذا الشهر", callback_data=f"payroll_pay_start:{employee_id}")],
-        [InlineKeyboardButton("✏️ تعديل القيمة/النسبة", callback_data=f"payroll_editamt:{employee_id}")],
+        [InlineKeyboardButton("💰 صرف راتب هذا الشهر", callback_data=f"fixed_pay_start:{employee_id}")],
+        [InlineKeyboardButton("✏️ تعديل الراتب", callback_data=f"fixed_editamt:{employee_id}")],
+        [InlineKeyboardButton("🗑️ حذف الموظف", callback_data=f"fixed_delete_confirm:{employee_id}")],
     ]
-    if emp["emp_type"] == "commission" and emp["retained_balance"] > 0:
-        buttons.append([InlineKeyboardButton("🏦 صرف الرصيد المحتجز", callback_data=f"payroll_release:{employee_id}")])
-    buttons.append([InlineKeyboardButton("🗑️ حذف الموظف", callback_data=f"payroll_delete_confirm:{employee_id}")])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def payroll_editamt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fixed_editamt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     employee_id = int(query.data.split(":")[1])
-    emp = get_payroll_employee(employee_id)
-    if not emp:
-        await query.edit_message_text("هذا الموظف لم يعد موجوداً.")
-        return
     context.user_data["kp_target"] = f"payroll_edit:{employee_id}"
     context.user_data["kp_value"] = ""
-    label = "الراتب الثابت الجديد" if emp["emp_type"] == "fixed" else "نسبة العمولة الجديدة %"
-    await query.edit_message_text(f"تعديل {emp['name']}")
-    await query.message.reply_text(
-        f"أدخل {label} باستخدام لوحة الأرقام:\n\nالقيمة الحالية: 0",
-        reply_markup=build_keypad_kb(""),
-    )
+    await query.message.reply_text("أدخل الراتب الجديد:\n\nالقيمة الحالية: 0", reply_markup=build_keypad_kb(""))
     return TARGET_AMOUNT
 
 
-async def payroll_pay_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fixed_pay_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     employee_id = int(query.data.split(":")[1])
@@ -3260,65 +3185,214 @@ async def payroll_pay_start_cb(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("هذا الموظف لم يعد موجوداً.")
         return
     month, year = month_year_now()
-    if emp["emp_type"] == "fixed":
-        gross = emp["fixed_amount"] or 0
-        retained = 0
-        paid = gross
-        text = (
-            f"صرف راتب {emp['name']} — شهر {month}-{year}\n\n"
-            f"الراتب الثابت: {gross:,.2f} د.ل\n"
-            f"الصافي المستحق للصرف: {paid:,.2f} د.ل"
-        )
-    else:
-        rep = get_user(emp["linked_rep_id"])
-        collected = get_total(get_payments_by_rep(emp["linked_rep_id"], month, year)) if rep else 0
-        gross = collected * (emp["commission_rate"] or 0) / 100
-        retained = gross * RETENTION_RATE
-        paid = gross - retained
-        text = (
-            f"صرف عمولة {emp['name']} — شهر {month}-{year}\n\n"
-            f"إجمالي تحصيل {rep['name'] if rep else '-'} هذا الشهر: {collected:,.2f} د.ل\n"
-            f"نسبة العمولة: {emp['commission_rate']:g}%\n"
-            f"إجمالي العمولة: {gross:,.2f} د.ل\n"
-            f"محتجز (كنترول 1%): {retained:,.2f} د.ل\n"
-            f"الصافي المستحق للصرف: {paid:,.2f} د.ل"
-        )
-        context.user_data["payroll_pay_collected"] = collected
-    context.user_data["payroll_pay"] = {"employee_id": employee_id, "gross": gross, "retained": retained, "paid": paid, "month": month, "year": year}
-    await query.edit_message_text(text, reply_markup=yesno_kb("payroll_pay_confirm", "payroll_pay_cancel", "✅ تأكيد الصرف", "❌ إلغاء"))
+    context.user_data["fixed_pay"] = {"employee_id": employee_id, "bonus": 0, "month": month, "year": year}
+    text = (
+        f"صرف راتب {emp['name']} — شهر {month}-{year}\n\n"
+        f"الراتب الثابت: {emp['fixed_amount']:,.2f} د.ل\n"
+        f"الصافي المستحق للصرف: {emp['fixed_amount']:,.2f} د.ل"
+    )
+    buttons = [
+        [InlineKeyboardButton("➕ إضافة مكافأة لهذا الصرف", callback_data=f"fixed_addbonus:{employee_id}")],
+        [InlineKeyboardButton("✅ تأكيد الصرف", callback_data="fixed_pay_confirm"), InlineKeyboardButton("❌ إلغاء", callback_data="fixed_pay_cancel")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def payroll_pay_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fixed_addbonus_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    employee_id = int(query.data.split(":")[1])
+    context.user_data["kp_target"] = f"fixed_bonus:{employee_id}"
+    context.user_data["kp_value"] = ""
+    await query.message.reply_text("أدخل قيمة المكافأة الإضافية لهذا الشهر:\n\nالقيمة الحالية: 0", reply_markup=build_keypad_kb(""))
+    return TARGET_AMOUNT
+
+
+async def fixed_pay_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     session = session_of(context)
-    data = context.user_data.pop("payroll_pay", None)
-    collected = context.user_data.pop("payroll_pay_collected", None)
-    if query.data == "payroll_pay_cancel" or not data:
+    data = context.user_data.pop("fixed_pay", None)
+    if query.data == "fixed_pay_cancel" or not data:
         await query.edit_message_text("تم الإلغاء.")
         return
     emp = get_payroll_employee(data["employee_id"])
-    add_payroll_payment(
-        data["employee_id"], data["month"], data["year"], collected,
-        data["gross"], data["retained"], data["paid"], session["id"],
+    gross = (emp["fixed_amount"] or 0) + data.get("bonus", 0)
+    add_payroll_payment(data["employee_id"], data["month"], data["year"], None, gross, 0, gross, session["id"])
+    bonus_line = f"\n🎁 مكافأة إضافية: {data['bonus']:,.2f} د.ل" if data.get("bonus") else ""
+    await query.edit_message_text(f"✅ تم صرف راتب {emp['name']} بنجاح — الصافي: {gross:,.2f} د.ل{bonus_line}")
+
+
+async def fixed_delete_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    employee_id = int(query.data.split(":")[1])
+    emp = get_payroll_employee(employee_id)
+    await query.edit_message_text(
+        f"⚠️ هل تريد حذف الموظف {emp['name']}؟",
+        reply_markup=yesno_kb(f"fixed_delete_do:{employee_id}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
     )
+
+
+async def fixed_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("تم الحذف")
+    employee_id = int(query.data.split(":")[1])
+    delete_payroll_employee(employee_id)
+    await query.edit_message_text("🗑️ تم حذف الموظف بنجاح.")
+
+
+async def fixed_report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    fixed_ids = [e["id"] for e in list_payroll_employees() if e["emp_type"] == "fixed"]
+    rows = [r for r in get_payroll_payments() if r["employee_id"] in fixed_ids]
+    if not rows:
+        await query.edit_message_text("لا توجد سجلات صرف رواتب ثابتة بعد.")
+        return
+    total = sum(r["paid_amount"] for r in rows)
+    lines = ["📊 تقرير الرواتب الثابتة\n"]
+    for r in rows[:30]:
+        lines.append(f"• {r['employee_name']} | {r['paid_amount']:,.2f} د.ل | {r['period_month']}-{r['period_year']}")
+    lines.append(f"\nإجمالي المصروف: {total:,.2f} د.ل")
+    context.user_data["last_report"] = ("payroll", rows, "الرواتب الثابتة", None)
+    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
+# ============================================================
+# ADMIN / ASSISTANT: مندوبي العمولة (بسيطة — تُسحب تلقائياً من التحصيل)
+# ============================================================
+
+async def commission_reps_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_timeout(update, context):
+        return LOGIN_USERNAME
+    session = session_of(context)
+    if session["role"] != "admin" and not user_has_permission(session, "manage_payroll"):
+        await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
+        return MAIN_MENU
+    employees = [e for e in list_payroll_employees() if e["emp_type"] == "commission"]
+    buttons = [[InlineKeyboardButton("➕ ربط مندوب بعمولة جديد", callback_data="commission_add_start")]]
+    for e in employees:
+        buttons.append([InlineKeyboardButton(f"👤 {e['name']} — {e['commission_rate']:g}%", callback_data=f"commission_view:{e['id']}")])
+    if employees:
+        buttons.append([InlineKeyboardButton("📊 تقرير العمولات", callback_data="commission_report")])
+    await update.message.reply_text("📊 مندوبو العمولة:", reply_markup=InlineKeyboardMarkup(buttons))
+    return MAIN_MENU
+
+
+async def commission_add_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    linked_ids = {e["linked_rep_id"] for e in list_payroll_employees() if e["emp_type"] == "commission"}
+    reps = [r for r in list_users_by_role("representative", active_only=True) if r["id"] not in linked_ids]
+    if not reps:
+        await query.edit_message_text("كل المندوبين النشطين مرتبطون بعمولة بالفعل، أو لا يوجد مندوبون.")
+        return
+    buttons = [[InlineKeyboardButton(r["name"], callback_data=f"commission_link_rep:{r['id']}")] for r in reps]
+    await query.edit_message_text("① اختر المندوب:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def commission_link_rep_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rep_id = int(query.data.split(":")[1])
+    rep = get_user(rep_id)
+    context.user_data["payroll_new"] = {"name": rep["name"], "linked_rep_id": rep_id}
+    context.user_data["kp_target"] = "payroll_new_rate"
+    context.user_data["kp_value"] = ""
+    await query.edit_message_text(f"المندوب: {rep['name']}")
+    await query.message.reply_text("② أدخل نسبة العمولة % (مثال: أدخل 5 لتعني 5%):\n\nالقيمة الحالية: 0", reply_markup=build_keypad_kb(""))
+    return TARGET_AMOUNT
+
+
+async def commission_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    employee_id = int(query.data.split(":")[1])
+    emp = get_payroll_employee(employee_id)
+    if not emp:
+        await query.edit_message_text("هذا المندوب لم يعد مرتبطاً بعمولة.")
+        return
+    text = (
+        f"👤 {emp['name']}\n"
+        f"نسبة العمولة: {emp['commission_rate']:g}%\n"
+        f"الرصيد المحتجز (كنترول 1%): {emp['retained_balance']:,.2f} د.ل"
+    )
+    buttons = [
+        [InlineKeyboardButton("💰 صرف عمولة هذا الشهر", callback_data=f"commission_pay_start:{employee_id}")],
+        [InlineKeyboardButton("✏️ تعديل النسبة", callback_data=f"commission_editrate:{employee_id}")],
+    ]
+    if emp["retained_balance"] > 0:
+        buttons.append([InlineKeyboardButton("🏦 صرف الرصيد المحتجز", callback_data=f"commission_release:{employee_id}")])
+    buttons.append([InlineKeyboardButton("🗑️ حذف الارتباط", callback_data=f"commission_delete_confirm:{employee_id}")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def commission_editrate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    employee_id = int(query.data.split(":")[1])
+    context.user_data["kp_target"] = f"payroll_edit:{employee_id}"
+    context.user_data["kp_value"] = ""
+    await query.message.reply_text("أدخل النسبة الجديدة %:\n\nالقيمة الحالية: 0", reply_markup=build_keypad_kb(""))
+    return TARGET_AMOUNT
+
+
+async def commission_pay_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    employee_id = int(query.data.split(":")[1])
+    emp = get_payroll_employee(employee_id)
+    if not emp:
+        await query.edit_message_text("هذا المندوب لم يعد مرتبطاً بعمولة.")
+        return
+    month, year = month_year_now()
+    rep = get_user(emp["linked_rep_id"])
+    collected = get_total(get_payments_by_rep(emp["linked_rep_id"], month, year)) if rep else 0
+    gross = collected * (emp["commission_rate"] or 0) / 100
+    retained = gross * RETENTION_RATE
+    paid = gross - retained
+    context.user_data["commission_pay"] = {"employee_id": employee_id, "gross": gross, "retained": retained, "paid": paid, "collected": collected, "month": month, "year": year}
+    text = (
+        f"صرف عمولة {emp['name']} — شهر {month}-{year}\n\n"
+        f"إجمالي تحصيل {rep['name'] if rep else '-'} هذا الشهر: {collected:,.2f} د.ل\n"
+        f"نسبة العمولة: {emp['commission_rate']:g}%\n"
+        f"إجمالي العمولة: {gross:,.2f} د.ل\n"
+        f"محتجز (كنترول 1%): {retained:,.2f} د.ل\n"
+        f"الصافي المستحق للصرف: {paid:,.2f} د.ل"
+    )
+    await query.edit_message_text(text, reply_markup=yesno_kb("commission_pay_confirm", "commission_pay_cancel", "✅ تأكيد الصرف", "❌ إلغاء"))
+
+
+async def commission_pay_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    data = context.user_data.pop("commission_pay", None)
+    if query.data == "commission_pay_cancel" or not data:
+        await query.edit_message_text("تم الإلغاء.")
+        return
+    emp = get_payroll_employee(data["employee_id"])
+    add_payroll_payment(data["employee_id"], data["month"], data["year"], data["collected"], data["gross"], data["retained"], data["paid"], session["id"])
     if data["retained"]:
         add_to_retained_balance(data["employee_id"], data["retained"])
-    await query.edit_message_text(f"✅ تم صرف راتب {emp['name']} بنجاح — الصافي: {data['paid']:,.2f} د.ل")
+    await query.edit_message_text(f"✅ تم صرف عمولة {emp['name']} بنجاح — الصافي: {data['paid']:,.2f} د.ل")
 
 
-async def payroll_release_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def commission_release_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     employee_id = int(query.data.split(":")[1])
     emp = get_payroll_employee(employee_id)
     await query.edit_message_text(
         f"⚠️ هل تريد صرف الرصيد المحتجز لـ {emp['name']} بالكامل ({emp['retained_balance']:,.2f} د.ل)؟",
-        reply_markup=yesno_kb(f"payroll_release_do:{employee_id}", "noop", "✅ نعم، اصرف", "❌ إلغاء"),
+        reply_markup=yesno_kb(f"commission_release_do:{employee_id}", "noop", "✅ نعم، اصرف", "❌ إلغاء"),
     )
 
 
-async def payroll_release_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def commission_release_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("تم الصرف")
     session = session_of(context)
@@ -3331,42 +3405,43 @@ async def payroll_release_do_cb(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(f"🏦 تم صرف الرصيد المحتجز لـ {emp['name']}: {amount:,.2f} د.ل")
 
 
-async def payroll_delete_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def commission_delete_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     employee_id = int(query.data.split(":")[1])
     emp = get_payroll_employee(employee_id)
     await query.edit_message_text(
-        f"⚠️ هل تريد حذف الموظف {emp['name']}؟ سيُحذف معه كل سجل صرف رواتبه.",
-        reply_markup=yesno_kb(f"payroll_delete_do:{employee_id}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
+        f"⚠️ هل تريد حذف ارتباط العمولة لـ {emp['name']}؟",
+        reply_markup=yesno_kb(f"commission_delete_do:{employee_id}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
     )
 
 
-async def payroll_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def commission_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("تم الحذف")
     employee_id = int(query.data.split(":")[1])
     delete_payroll_employee(employee_id)
-    await query.edit_message_text("🗑️ تم حذف الموظف بنجاح.")
+    await query.edit_message_text("🗑️ تم حذف الارتباط بنجاح.")
 
 
-async def payroll_report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def commission_report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     session = session_of(context)
-    rows = get_payroll_payments()
+    comm_ids = [e["id"] for e in list_payroll_employees() if e["emp_type"] == "commission"]
+    rows = [r for r in get_payroll_payments() if r["employee_id"] in comm_ids]
     if not rows:
-        await query.edit_message_text("لا توجد سجلات صرف رواتب بعد.")
+        await query.edit_message_text("لا توجد سجلات صرف عمولات بعد.")
         return
     total_paid = sum(r["paid_amount"] for r in rows)
     total_retained = sum(r["retained_amount"] for r in rows)
-    lines = ["📊 تقرير الرواتب\n"]
+    lines = ["📊 تقرير العمولات\n"]
     for r in rows[:30]:
-        kind_label = "صرف راتب" if r["kind"] == "payout" else "صرف رصيد محتجز"
+        kind_label = "صرف عمولة" if r["kind"] == "payout" else "صرف رصيد محتجز"
         lines.append(f"• {r['employee_name']} | {kind_label} | {r['paid_amount']:,.2f} د.ل | {r['period_month']}-{r['period_year']}")
     lines.append(f"\nإجمالي المصروف: {total_paid:,.2f} د.ل")
-    lines.append(f"إجمالي المحتجز المتراكم من العمليات: {total_retained:,.2f} د.ل")
-    context.user_data["last_report"] = ("payroll", rows, "كل الموظفين", None)
+    lines.append(f"إجمالي المحتجز من هذه العمليات: {total_retained:,.2f} د.ل")
+    context.user_data["last_report"] = ("payroll", rows, "مندوبو العمولة", None)
     buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
@@ -4170,10 +4245,12 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await professional_use_target_menu(update, context)
     if text == "🏦 حسابات شركة الحياة فارما":
         return await company_accounts_menu(update, context)
-    if text == "💵 مصاريف":
+    if text == "💵 مصروفات":
         return await expenses_menu(update, context)
-    if text == "💼 الرواتب":
-        return await payroll_menu(update, context)
+    if text == "💼 صرف الرواتب الثابتة":
+        return await fixed_salaries_menu(update, context)
+    if text == "📊 مندوبي العمولة":
+        return await commission_reps_menu(update, context)
 
     await update.message.reply_text("الرجاء استخدام الأزرار في القائمة.", reply_markup=main_menu_kb(session))
     return MAIN_MENU
@@ -4309,24 +4386,37 @@ def build_app():
                 CallbackQueryHandler(cattarget_delete_cb, pattern="^cattarget_delete:"),
                 CallbackQueryHandler(cattarget_delete_do_cb, pattern="^cattarget_delete_do:"),
                 CallbackQueryHandler(expense_add_start_cb, pattern="^expense_add_start$"),
-                CallbackQueryHandler(expense_report_menu_cb, pattern="^expense_report_menu$"),
-                CallbackQueryHandler(expreport_cb, pattern="^expreport:"),
-                CallbackQueryHandler(expreportpick_cb, pattern="^expreportpick:"),
-                CallbackQueryHandler(expmonth_cb, pattern="^expmonth:"),
-                CallbackQueryHandler(payroll_add_start_cb, pattern="^payroll_add_start$"),
-                CallbackQueryHandler(payroll_class_cb, pattern="^payroll_class:"),
-                CallbackQueryHandler(payroll_type_cb, pattern="^payroll_type:"),
-                CallbackQueryHandler(payroll_link_rep_cb, pattern="^payroll_link_rep:"),
-                CallbackQueryHandler(payroll_list_cb, pattern="^payroll_list$"),
-                CallbackQueryHandler(payroll_view_cb, pattern="^payroll_view:"),
-                CallbackQueryHandler(payroll_editamt_cb, pattern="^payroll_editamt:"),
-                CallbackQueryHandler(payroll_pay_start_cb, pattern="^payroll_pay_start:"),
-                CallbackQueryHandler(payroll_pay_confirm_cb, pattern="^(payroll_pay_confirm|payroll_pay_cancel)$"),
-                CallbackQueryHandler(payroll_release_cb, pattern="^payroll_release:"),
-                CallbackQueryHandler(payroll_release_do_cb, pattern="^payroll_release_do:"),
-                CallbackQueryHandler(payroll_delete_confirm_cb, pattern="^payroll_delete_confirm:"),
-                CallbackQueryHandler(payroll_delete_do_cb, pattern="^payroll_delete_do:"),
-                CallbackQueryHandler(payroll_report_cb, pattern="^payroll_report$"),
+                CallbackQueryHandler(expense_pickdept_cb, pattern="^expense_pickdept:"),
+                CallbackQueryHandler(expense_view_cb, pattern="^expense_view:"),
+                CallbackQueryHandler(expense_editdept_cb, pattern="^expense_editdept:"),
+                CallbackQueryHandler(expense_setdept_cb, pattern="^expense_setdept:"),
+                CallbackQueryHandler(expense_editamt_cb, pattern="^expense_editamt:"),
+                CallbackQueryHandler(expense_editdesc_cb, pattern="^expense_editdesc:"),
+                CallbackQueryHandler(expense_editdate_cb, pattern="^expense_editdate:"),
+                CallbackQueryHandler(expeditdate_pick_cb, pattern="^expeditdate:"),
+                CallbackQueryHandler(expense_delete_confirm_cb, pattern="^expense_delete_confirm:"),
+                CallbackQueryHandler(expense_delete_do_cb, pattern="^expense_delete_do:"),
+                CallbackQueryHandler(expense_report_cb, pattern="^expense_report$"),
+                CallbackQueryHandler(fixed_add_start_cb, pattern="^fixed_add_start$"),
+                CallbackQueryHandler(fixed_view_cb, pattern="^fixed_view:"),
+                CallbackQueryHandler(fixed_editamt_cb, pattern="^fixed_editamt:"),
+                CallbackQueryHandler(fixed_pay_start_cb, pattern="^fixed_pay_start:"),
+                CallbackQueryHandler(fixed_addbonus_cb, pattern="^fixed_addbonus:"),
+                CallbackQueryHandler(fixed_pay_confirm_cb, pattern="^(fixed_pay_confirm|fixed_pay_cancel)$"),
+                CallbackQueryHandler(fixed_delete_confirm_cb, pattern="^fixed_delete_confirm:"),
+                CallbackQueryHandler(fixed_delete_do_cb, pattern="^fixed_delete_do:"),
+                CallbackQueryHandler(fixed_report_cb, pattern="^fixed_report$"),
+                CallbackQueryHandler(commission_add_start_cb, pattern="^commission_add_start$"),
+                CallbackQueryHandler(commission_link_rep_cb, pattern="^commission_link_rep:"),
+                CallbackQueryHandler(commission_view_cb, pattern="^commission_view:"),
+                CallbackQueryHandler(commission_editrate_cb, pattern="^commission_editrate:"),
+                CallbackQueryHandler(commission_pay_start_cb, pattern="^commission_pay_start:"),
+                CallbackQueryHandler(commission_pay_confirm_cb, pattern="^(commission_pay_confirm|commission_pay_cancel)$"),
+                CallbackQueryHandler(commission_release_cb, pattern="^commission_release:"),
+                CallbackQueryHandler(commission_release_do_cb, pattern="^commission_release_do:"),
+                CallbackQueryHandler(commission_delete_confirm_cb, pattern="^commission_delete_confirm:"),
+                CallbackQueryHandler(commission_delete_do_cb, pattern="^commission_delete_do:"),
+                CallbackQueryHandler(commission_report_cb, pattern="^commission_report$"),
                 CallbackQueryHandler(catmonth_cb, pattern="^catmonth:"),
                 CallbackQueryHandler(noop_cb, pattern="^noop$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router),
@@ -4429,23 +4519,9 @@ def build_app():
                 MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_desc_do),
             ],
-            EXPENSE_FLOW: [
-                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
-                CallbackQueryHandler(expdate_cb, pattern="^expdate:"),
-                CallbackQueryHandler(expattr_cb, pattern="^expattr:"),
-                CallbackQueryHandler(expattrpick_cb, pattern="^expattrpick:"),
-                CallbackQueryHandler(expense_save_cb, pattern="^(expense_save|expense_cancel)$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_date_text_do),
-            ],
             PAYROLL_EMP_NAME: [
                 MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, payroll_emp_name_do),
-            ],
-            PAYROLL_EMP_AMOUNT: [
-                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
-                CallbackQueryHandler(payroll_class_cb, pattern="^payroll_class:"),
-                CallbackQueryHandler(payroll_type_cb, pattern="^payroll_type:"),
-                CallbackQueryHandler(payroll_link_rep_cb, pattern="^payroll_link_rep:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fixed_name_do),
             ],
         },
         fallbacks=[
