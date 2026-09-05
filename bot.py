@@ -382,6 +382,16 @@ def delete_payment(payment_id):
     conn.close()
 
 
+def transfer_payments(payment_ids, new_rep_id):
+    if not payment_ids:
+        return
+    conn = get_db()
+    placeholders = ",".join("?" for _ in payment_ids)
+    conn.execute(f"UPDATE payments SET representative_id=? WHERE id IN ({placeholders})", (new_rep_id, *payment_ids))
+    conn.commit()
+    conn.close()
+
+
 def get_payments_by_rep(rep_id, month=None, year=None):
     conn = get_db()
     q = "SELECT * FROM payments WHERE representative_id=?"
@@ -734,14 +744,14 @@ LOGIN_KB = kb([["🔐 دخول"]])
 CANCEL_KB = kb([["❌ إلغاء الأمر"]])
 SKIP_CANCEL_KB = kb([["⏭️ تخطي"], ["❌ إلغاء الأمر"]])
 
-REP_MENU_ROWS = [["💰 التحصيل", "🔍 البحث عن عميل"], ["📊 تقرير السدادات"], ["🚪 خروج"]]
+REP_MENU_ROWS = [["💰 التحصيل", "🔍 البحث عن عميل"], ["📊 تقرير السدادات"], ["❌ إلغاء الأمر", "🚪 خروج"]]
 
 ADMIN_MENU_ROWS = [
     ["💰 التحصيل", "👥 المندوبين"],
     ["👨‍💼 المساعدين", "🎯 أهداف التحصيل"],
     ["💰 الجباية", "🔍 البحث عن عميل"],
     ["📊 التقارير", "📩 إرسال رسالة"],
-    ["🚪 خروج"],
+    ["❌ إلغاء الأمر", "🚪 خروج"],
 ]
 
 
@@ -777,7 +787,7 @@ def main_menu_kb(session):
         rows.append(rows3)
     if perms.get("send_messages"):
         rows.append(["📩 إرسال رسالة"])
-    rows.append(["🚪 خروج"])
+    rows.append(["❌ إلغاء الأمر", "🚪 خروج"])
     return kb(rows)
 
 
@@ -1109,8 +1119,71 @@ async def check_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def collect_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_timeout(update, context):
         return LOGIN_USERNAME
+    session = session_of(context)
     context.user_data["collect"] = {}
-    await update.message.reply_text("أدخل اسم العميل:", reply_markup=CANCEL_KB)
+    context.user_data.pop("collect_on_behalf_of", None)
+    if session["role"] == "representative":
+        await update.message.reply_text("أدخل اسم العميل:", reply_markup=CANCEL_KB)
+        return COLLECT_CUSTOMER
+    # المدير أو المساعد المخوّل: يختار باسمه هو أم باسم مندوب أم باسم مساعد
+    buttons = [
+        [InlineKeyboardButton("👤 باسمي", callback_data="collectas:self")],
+        [InlineKeyboardButton("👥 باسم مندوب", callback_data="collectas:rep")],
+        [InlineKeyboardButton("🧑‍💼 باسم مساعد", callback_data="collectas:assistant")],
+    ]
+    await update.message.reply_text("سجّل عملية التحصيل هذه:", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text("يمكنك الإلغاء في أي وقت:", reply_markup=CANCEL_KB)
+    return MAIN_MENU
+
+
+async def collectas_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    kind = query.data.split(":")[1]
+    context.user_data["collect"] = {}
+    if kind == "self":
+        context.user_data.pop("collect_on_behalf_of", None)
+        await query.edit_message_text("👤 التحصيل باسمك.")
+        await query.message.reply_text("أدخل اسم العميل:", reply_markup=CANCEL_KB)
+        return COLLECT_CUSTOMER
+    if kind == "assistant":
+        assistants = list_users_by_role("assistant", active_only=True)
+        if not assistants:
+            await query.edit_message_text("لا يوجد مساعدون نشطون حالياً.")
+            return MAIN_MENU
+        buttons = [[InlineKeyboardButton(a["name"], callback_data=f"collectassistant:{a['id']}")] for a in assistants]
+        await query.edit_message_text("اختر المساعد:", reply_markup=InlineKeyboardMarkup(buttons))
+        return MAIN_MENU
+    reps = list_users_by_role("representative", active_only=True)
+    if not reps:
+        await query.edit_message_text("لا يوجد مندوبون نشطون حالياً.")
+        return MAIN_MENU
+    buttons = [[InlineKeyboardButton(r["name"], callback_data=f"collectrep:{r['id']}")] for r in reps]
+    await query.edit_message_text("اختر المندوب:", reply_markup=InlineKeyboardMarkup(buttons))
+    return MAIN_MENU
+
+
+async def collectrep_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rep_id = int(query.data.split(":")[1])
+    rep = get_user(rep_id)
+    context.user_data["collect"] = {}
+    context.user_data["collect_on_behalf_of"] = rep_id
+    await query.edit_message_text(f"👥 التحصيل باسم المندوب: {rep['name']}")
+    await query.message.reply_text("أدخل اسم العميل:", reply_markup=CANCEL_KB)
+    return COLLECT_CUSTOMER
+
+
+async def collectassistant_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    assistant_id = int(query.data.split(":")[1])
+    assistant = get_user(assistant_id)
+    context.user_data["collect"] = {}
+    context.user_data["collect_on_behalf_of"] = assistant_id
+    await query.edit_message_text(f"🧑‍💼 التحصيل باسم المساعد: {assistant['name']}")
+    await query.message.reply_text("أدخل اسم العميل:", reply_markup=CANCEL_KB)
     return COLLECT_CUSTOMER
 
 
@@ -1210,24 +1283,29 @@ async def save_payment_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data.get("collect", {})
     if query.data == "cancel_payment" or not data:
         await query.edit_message_text("تم الإلغاء.")
+        context.user_data.pop("collect_on_behalf_of", None)
         await send_main_menu(query, context)
         return MAIN_MENU
-    add_payment(data["customer_name"], data["amount"], data["method"], data["payment_date"], session["id"])
+    on_behalf_id = context.user_data.pop("collect_on_behalf_of", None)
+    recorded_user = get_user(on_behalf_id) if on_behalf_id else session
+    target_user_id = recorded_user["id"] if on_behalf_id else session["id"]
+    add_payment(data["customer_name"], data["amount"], data["method"], data["payment_date"], target_user_id)
     try:
         pay_month, pay_year = map(int, data["payment_date"].split("-")[1::-1])
     except Exception:
         pay_month, pay_year = month_year_now()
-    target, collected, remaining, pct = current_month_target_progress(session["id"], pay_month, pay_year)
+    target, collected, remaining, pct = current_month_target_progress(target_user_id, pay_month, pay_year)
+    name_line = f"👤 باسم: {recorded_user['name']}" if on_behalf_id else f"👤 باسم: {session['name']}"
     await query.edit_message_text(
         "✅ تم تسجيل السداد بنجاح\n\n"
         f"👤 العميل: {data['customer_name']}\n"
         f"💰 القيمة: {data['amount']:,.2f} د.ل\n"
         f"💳 الطريقة: {data['method']}\n"
         f"📅 التاريخ: {data['payment_date']}\n"
-        f"👤 المندوب: {session['name']}\n\n"
+        f"{name_line}\n\n"
         f"{target_progress_text(target, collected, remaining, pct)}"
     )
-    await notify_admins_new_payment(context, session, data)
+    await notify_admins_new_payment(context, recorded_user, data)
     context.user_data.pop("collect", None)
     await query.message.reply_text("العملية التالية:", reply_markup=main_menu_kb(session))
     return MAIN_MENU
@@ -1238,7 +1316,7 @@ async def notify_admins_new_payment(context: ContextTypes.DEFAULT_TYPE, rep_sess
     ولكل مساعد فعّل له المدير صلاحية '💰 مشاهدة الجباية'."""
     text = (
         f"🔔 عملية سداد جديدة\n\n"
-        f"👤 المندوب: {rep_session['name']}\n"
+        f"👤 باسم: {rep_session['name']}\n"
         f"🏪 العميل: {data['customer_name']}\n"
         f"💰 القيمة: {data['amount']:,.2f} د.ل\n"
         f"💳 الطريقة: {data['method']}\n"
@@ -1288,10 +1366,59 @@ async def search_customer_do(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append(f"\nإجمالي السدادات: {total:,.2f} د.ل")
     context.user_data["last_search"] = {"name": name, "rows": rows}
     can_export = session["role"] != "assistant" or user_has_permission(session, "export_pdf")
-    buttons = [[InlineKeyboardButton("📄 تصدير كشف حساب PDF", callback_data="export_customer_pdf")]] if can_export else None
+    buttons = []
+    if can_export:
+        buttons.append([InlineKeyboardButton("📄 تصدير كشف حساب PDF", callback_data="export_customer_pdf")])
+    if session["role"] != "representative" and user_has_permission(session, "edit_payments"):
+        buttons.append([InlineKeyboardButton("🔄 نقل هذا العميل لمندوب آخر", callback_data="transfer_customer_start")])
     await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
     await send_main_menu(update, context)
     return MAIN_MENU
+
+
+async def transfer_customer_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if session["role"] == "representative" or not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية نقل العملاء بين المندوبين.")
+        return
+    data = context.user_data.get("last_search")
+    if not data:
+        await query.edit_message_text("انتهت صلاحية هذه النتيجة، أعد البحث من فضلك.")
+        return
+    reps = list_users_by_role("representative", active_only=True)
+    if not reps:
+        await query.edit_message_text("لا يوجد مندوبون نشطون لنقل العميل إليهم.")
+        return
+    buttons = [[InlineKeyboardButton(r["name"], callback_data=f"transfer_customer_to:{r['id']}")] for r in reps]
+    await query.edit_message_text(
+        f"اختر المندوب الذي تريد نقل عميل «{data['name']}» إليه:\n"
+        f"(سيتم نقل {len(data['rows'])} عملية سداد إلى حسابه)",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def transfer_customer_to_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if session["role"] == "representative" or not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية نقل العملاء بين المندوبين.")
+        return
+    data = context.user_data.get("last_search")
+    if not data:
+        await query.edit_message_text("انتهت صلاحية هذه النتيجة، أعد البحث من فضلك.")
+        return
+    new_rep_id = int(query.data.split(":")[1])
+    new_rep = get_user(new_rep_id)
+    payment_ids = [r["id"] for r in data["rows"]]
+    transfer_payments(payment_ids, new_rep_id)
+    context.user_data.pop("last_search", None)
+    await query.edit_message_text(
+        f"✅ تم نقل {len(payment_ids)} عملية سداد للعميل «{data['name']}» إلى المندوب: {new_rep['name']}\n\n"
+        f"ستظهر هذه العمليات الآن ضمن سدادات وأهداف {new_rep['name']}."
+    )
 
 
 async def export_customer_pdf_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2248,6 +2375,10 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     if text == "🚪 خروج":
         return await logout(update, context)
+    if text == "❌ إلغاء الأمر":
+        context.user_data.pop("collect_on_behalf_of", None)
+        context.user_data.pop("collect", None)
+        return await cancel_to_menu(update, context)
 
     # representative
     if text == "💰 التحصيل" and (
@@ -2306,9 +2437,13 @@ def build_app():
             LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
 
             MAIN_MENU: [
+                CallbackQueryHandler(collectas_cb, pattern="^collectas:"),
+                CallbackQueryHandler(collectrep_cb, pattern="^collectrep:"),
+                CallbackQueryHandler(collectassistant_cb, pattern="^collectassistant:"),
                 CallbackQueryHandler(collect_method_cb, pattern=f"^{CB_METHOD}"),
-                CallbackQueryHandler(save_payment_cb, pattern="^(save_payment|cancel_payment)$"),
                 CallbackQueryHandler(export_customer_pdf_cb, pattern="^export_customer_pdf$"),
+                CallbackQueryHandler(transfer_customer_start_cb, pattern="^transfer_customer_start$"),
+                CallbackQueryHandler(transfer_customer_to_cb, pattern="^transfer_customer_to:"),
                 CallbackQueryHandler(export_rep_report_pdf_cb, pattern="^export_rep_report_pdf$"),
                 CallbackQueryHandler(rep_view_cb, pattern="^rep_view:"),
                 CallbackQueryHandler(rep_toggle_cb, pattern="^rep_toggle:"),
