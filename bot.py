@@ -828,11 +828,29 @@ def generate_rep_report_pdf(rep_name, rows, out_path, period_label="", target_in
     return out_path
 
 
-def generate_general_report_pdf(rows, out_path, period_label=""):
+def generate_general_report_pdf(rows, out_path, period_label="", target_info=None):
     pdf = ArabicPDF(subtitle="التقرير العام للتحصيل")
     if period_label:
         pdf.info_line("الفترة", period_label)
     pdf.info_line("تاريخ الاستخراج", datetime.now().strftime("%Y-%m-%d"))
+    if target_info:
+        target, collected, remaining, pct = target_info
+        if target:
+            pdf.ln(1)
+            pdf.set_fill_color(230, 245, 245)
+            pdf._font("B", 11)
+            pdf.cell(0, 7, ar(f"الهدف الشهري: {target:,.2f} د.ل"), align="R", fill=True)
+            pdf.ln(7)
+            pdf.cell(0, 7, ar(f"المحصل: {collected:,.2f} د.ل"), align="R", fill=True)
+            pdf.ln(7)
+            pdf.cell(0, 7, ar(f"نسبة الإنجاز: {pct:.0f}%"), align="R", fill=True)
+            pdf.ln(7)
+            if collected >= target:
+                surplus = collected - target
+                pdf.cell(0, 7, ar(f"تم تجاوز الهدف بمقدار {surplus:,.2f} د.ل"), align="R", fill=True)
+            else:
+                pdf.cell(0, 7, ar(f"المتبقي: {remaining:,.2f} د.ل"), align="R", fill=True)
+            pdf.ln(9)
     pdf.ln(2)
     headers = ["طريقة السداد", "قيمة السداد", "التاريخ", "العميل", "المندوب"]
     widths = [35, 30, 30, 40, 35]
@@ -2200,9 +2218,12 @@ async def category_target_menu(update: Update, context: ContextTypes.DEFAULT_TYP
         f"المندوبون في هذا التصنيف: {rep_names}\n\n"
         f"{target_progress_text(target, collected, remaining, pct)}"
     )
+    context.user_data["last_report"] = ("general", rows, label, (target, collected, remaining, pct))
     buttons = [[InlineKeyboardButton("✏️ تحديد/تعديل الهدف", callback_data=f"cattarget_set:{category}")]]
     if target:
         buttons.append([InlineKeyboardButton("🗑️ حذف الهدف الحالي", callback_data=f"cattarget_delete:{category}")])
+    if user_has_permission(session, "export_pdf"):
+        buttons.append([InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")])
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     return MAIN_MENU
 
@@ -2706,7 +2727,7 @@ async def export_report_pdf_cb(update: Update, context: ContextTypes.DEFAULT_TYP
     target_info = report[3] if len(report) > 3 else None
     path = f"/tmp/report_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
     if kind == "general":
-        await safe_send_pdf(query.message, generate_general_report_pdf, path, f"{label or 'تقرير'}.pdf", data, period_label=label)
+        await safe_send_pdf(query.message, generate_general_report_pdf, path, f"{label or 'تقرير'}.pdf", data, period_label=label, target_info=target_info)
     elif kind == "rep":
         await safe_send_pdf(query.message, generate_rep_report_pdf, path, f"تقرير - {label}.pdf", label, data, target_info=target_info)
     elif kind == "method":
