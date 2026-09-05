@@ -14,7 +14,7 @@ import asyncio
 import hashlib
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 
 from telegram import (
     Update,
@@ -253,6 +253,14 @@ def init_db():
             c.execute(ddl)
         except sqlite3.OperationalError:
             pass
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            occurred_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_activity_user_time ON activity_log(user_id, occurred_at)")
     conn.commit()
     conn.close()
 
@@ -334,6 +342,58 @@ def update_last_seen(user_id):
     conn.execute("UPDATE users SET last_seen=datetime('now') WHERE id=?", (user_id,))
     conn.commit()
     conn.close()
+
+
+def log_activity(user_id):
+    conn = get_db()
+    conn.execute("INSERT INTO activity_log (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_week_range(end_date=None):
+    """نافذة أسبوع متدحرجة من 7 أيام تنتهي بتاريخ end_date (اليوم افتراضياً)، شاملة الطرفين."""
+    end = end_date or datetime.now().date()
+    start = end - timedelta(days=6)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
+def get_rep_week_stats(rep_id, start_date, end_date):
+    conn = get_db()
+    payments = conn.execute(
+        "SELECT amount FROM payments WHERE representative_id=? AND payment_date BETWEEN ? AND ?",
+        (rep_id, start_date, end_date),
+    ).fetchall()
+    activity = conn.execute(
+        "SELECT DISTINCT date(occurred_at) as d FROM activity_log WHERE user_id=? AND date(occurred_at) BETWEEN ? AND ?",
+        (rep_id, start_date, end_date),
+    ).fetchall()
+    interactions = conn.execute(
+        "SELECT COUNT(*) as c FROM activity_log WHERE user_id=? AND date(occurred_at) BETWEEN ? AND ?",
+        (rep_id, start_date, end_date),
+    ).fetchone()
+    conn.close()
+    total = sum(p["amount"] for p in payments)
+    active_days = len(activity)
+    return {
+        "total": total,
+        "payment_count": len(payments),
+        "interactions": interactions["c"] if interactions else 0,
+        "active_days": active_days,
+        "away_days": max(7 - active_days, 0),
+    }
+
+
+def build_weekly_report_data(category, start_date, end_date):
+    reps = [u for u in list_users_by_role("representative", active_only=True) if u["category"] == category]
+    stats = []
+    for rep in reps:
+        s = get_rep_week_stats(rep["id"], start_date, end_date)
+        s["name"] = rep["name"]
+        stats.append(s)
+    stats.sort(key=lambda x: x["total"], reverse=True)
+    overall_total = sum(s["total"] for s in stats)
+    return stats, overall_total
 
 
 def list_users_by_role(role, active_only=False):
@@ -889,6 +949,101 @@ def generate_method_report_pdf(totals: dict, out_path, period_label=""):
     return out_path
 
 
+def draw_weekly_bar_chart(pdf, stats):
+    if not stats:
+        return
+    pdf._font("B", 12)
+    pdf.set_fill_color(230, 245, 245)
+    pdf.cell(0, 9, ar("📊 مخطط الترتيب — من الأكثر تحصيلاً إلى الأقل"), align="C", fill=True)
+    pdf.ln(11)
+    max_amount = max((s["total"] for s in stats), default=0) or 1
+    x_start = 20
+    bar_area_w = 120
+    name_x = 148
+    name_w = 45
+    row_h = 9
+    for s in stats:
+        y0 = pdf.get_y()
+        if y0 > 260:  # حماية بسيطة من تجاوز الصفحة
+            pdf.add_page()
+            y0 = pdf.get_y()
+        bar_w = (s["total"] / max_amount) * bar_area_w if max_amount else 0
+        pdf.set_fill_color(0, 130, 130)
+        pdf.rect(x_start, y0 + 1, max(bar_w, 0.5), row_h - 2, style="F")
+        pdf._font("", 9)
+        pdf.set_xy(x_start + bar_w + 2, y0)
+        pdf.cell(24, row_h, f"{s['total']:,.0f}", align="L")
+        pdf.set_xy(name_x, y0)
+        pdf._font("B", 10)
+        pdf.cell(name_w, row_h, ar(s["name"]), align="R")
+        pdf.set_y(y0 + row_h)
+    pdf.ln(4)
+
+
+def suggestion_for_rank(index, count):
+    if count <= 1:
+        return "ℹ️ المندوب الوحيد في هذا التصنيف هذا الأسبوع، لا يوجد ترتيب مقارن."
+    if index == 0:
+        return "🏆 الأقوى أداءً هذا الأسبوع — يُقترح منحه مكافأة مالية أو إجازة 4 أيام."
+    if index == count - 1:
+        return "⚠️ الأضعف أداءً هذا الأسبوع — يُقترح توجيه إنذار مع خصم بسيط."
+    return "💬 أداء متوسط هذا الأسبوع — يُقترح تحفيز كلامي بسيط لرفع الحماس."
+
+
+def generate_weekly_report_pdf(category, start_date, end_date, stats, overall_total, out_path):
+    label = CATEGORY_LABELS[category]
+    pdf = ArabicPDF(subtitle=f"تقرير أسبوعي بالجباية — {label}")
+    pdf.info_line("الفترة", f"من {start_date} إلى {end_date}")
+    pdf.info_line("تاريخ الاستخراج", datetime.now().strftime("%Y-%m-%d"))
+    pdf.ln(2)
+
+    if not stats:
+        pdf._font("", 12)
+        pdf.cell(0, 10, ar("لا يوجد مندوبون في هذا التصنيف هذا الأسبوع."), align="C")
+        pdf.output(out_path)
+        return out_path
+
+    headers = ["أيام الابتعاد", "عدد التفاعلات", "عدد عمليات السداد", "إجمالي التحصيل", "المندوب"]
+    widths = [28, 28, 32, 40, 45]
+    data = [[str(s["away_days"]), str(s["interactions"]), str(s["payment_count"]), f"{s['total']:,.2f}", s["name"]] for s in stats]
+    _table(pdf, headers, data, widths)
+    pdf.ln(3)
+    pdf._font("B", 13)
+    pdf.set_fill_color(0, 90, 90)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_x((210 - sum(widths)) / 2)
+    pdf.cell(sum(widths), 10, ar(f"إجمالي تحصيل {label} هذا الأسبوع: {overall_total:,.2f} د.ل"), align="C", fill=True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(14)
+
+    draw_weekly_bar_chart(pdf, stats)
+
+    pdf._font("B", 13)
+    pdf.set_fill_color(230, 245, 245)
+    pdf.cell(0, 10, ar("📝 تحليل الأداء والاقتراحات"), align="R", fill=True)
+    pdf.ln(12)
+    count = len(stats)
+    for i, s in enumerate(stats):
+        pdf._font("B", 11)
+        pdf.cell(0, 7, ar(f"👤 {s['name']}"), align="R")
+        pdf.ln(7)
+        pdf._font("", 10)
+        pdf.cell(0, 6, ar(f"إجمالي التحصيل: {s['total']:,.2f} د.ل"), align="R")
+        pdf.ln(6)
+        pdf.cell(0, 6, ar(f"عدد مرات تسجيل السداد: {s['payment_count']}"), align="R")
+        pdf.ln(6)
+        pdf.cell(0, 6, ar(f"عدد مرات التفاعل مع البوت: {s['interactions']}"), align="R")
+        pdf.ln(6)
+        pdf.cell(0, 6, ar(f"عدد أيام الابتعاد عن البوت (من 7): {s['away_days']}"), align="R")
+        pdf.ln(6)
+        pdf._font("B", 10)
+        pdf.cell(0, 7, ar(suggestion_for_rank(i, count)), align="R")
+        pdf.ln(10)
+
+    pdf.output(out_path)
+    return out_path
+
+
 async def check_pdf_ready(message_target) -> bool:
     """Sends a clear warning and returns False if the Arabic font is missing,
     so PDF generation isn't attempted with a font that can't render Arabic text."""
@@ -1151,6 +1306,7 @@ def touch_session(context):
     session = context.user_data.get("session")
     if session:
         update_last_seen(session["id"])
+        log_activity(session["id"])
 
 
 def session_expired(context):
@@ -3134,6 +3290,33 @@ async def _post_init(application: Application):
         pass
 
 
+async def send_weekly_reports_job(context: ContextTypes.DEFAULT_TYPE):
+    """يُرسل تقريراً أسبوعياً بصيغة PDF (Home Use و Professional Use) لكل حسابات
+    المدير والمساعدين، كل يوم جمعة الساعة 3 عصراً بتوقيت ليبيا."""
+    start_date, end_date = get_week_range()
+    recipients = list(list_users_by_role("admin")) + list(list_users_by_role("assistant", active_only=True))
+    for category in ("home", "professional"):
+        stats, overall_total = build_weekly_report_data(category, start_date, end_date)
+        path = f"/tmp/weekly_{category}_{end_date}.pdf"
+        try:
+            generate_weekly_report_pdf(category, start_date, end_date, stats, overall_total, path)
+        except Exception:
+            logger.exception("فشل إنشاء التقرير الأسبوعي لتصنيف %s", category)
+            continue
+        caption = f"📆 التقرير الأسبوعي — {CATEGORY_LABELS[category]}\nمن {start_date} إلى {end_date}"
+        for user in recipients:
+            if user["telegram_id"]:
+                try:
+                    with open(path, "rb") as f:
+                        await context.bot.send_document(user["telegram_id"], document=f, filename=os.path.basename(path), caption=caption)
+                except Exception:
+                    pass
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
 def build_app():
     init_db()
     # حفظ حالة الجلسات (تسجيل الدخول وما إلى ذلك) على نفس القرص الدائم لقاعدة البيانات،
@@ -3328,6 +3511,16 @@ def build_app():
     )
 
     app.add_handler(conv)
+
+    # جدولة التقرير الأسبوعي: كل يوم جمعة الساعة 3:00 عصراً بتوقيت ليبيا (طرابلس)
+    try:
+        from zoneinfo import ZoneInfo
+        tripoli_tz = ZoneInfo("Africa/Tripoli")
+        weekly_time = dt_time(hour=15, minute=0, tzinfo=tripoli_tz)
+        app.job_queue.run_daily(send_weekly_reports_job, time=weekly_time, days=(4,), name="weekly_report_friday")
+    except Exception:
+        logger.exception("تعذّرت جدولة التقرير الأسبوعي — تأكد من توفر حزمة tzdata")
+
     return app
 
 
