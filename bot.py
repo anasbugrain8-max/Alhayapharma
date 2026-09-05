@@ -467,6 +467,13 @@ def get_target(rep_id, month, year):
     return row["target_amount"] if row else 0
 
 
+def delete_target(rep_id, month, year):
+    conn = get_db()
+    conn.execute("DELETE FROM targets WHERE representative_id=? AND month=? AND year=?", (rep_id, month, year))
+    conn.commit()
+    conn.close()
+
+
 def log_message(sender_id, recipient_id, recipient_type, body):
     conn = get_db()
     conn.execute(
@@ -1636,10 +1643,26 @@ async def targets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     buttons = [[InlineKeyboardButton(r["name"], callback_data=f"target_pick:{r['id']}")] for r in reps]
     await update.message.reply_text("اختر المندوب لتحديد هدفه الشهري:", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text("يمكنك الإلغاء في أي وقت:", reply_markup=CANCEL_KB)
     return MAIN_MENU
 
 
 async def target_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rep_id = int(query.data.split(":")[1])
+    rep = get_user(rep_id)
+    m, y = month_year_now()
+    current = get_target(rep_id, m, y)
+    text = f"المندوب: {rep['name']}\nالشهر الحالي: {MONTHS_AR[m-1]} {y}\nالهدف الحالي: {current:,.2f} د.ل" if current else \
+           f"المندوب: {rep['name']}\nالشهر الحالي: {MONTHS_AR[m-1]} {y}\nلا يوجد هدف محدد بعد لهذا الشهر."
+    buttons = [[InlineKeyboardButton("✏️ تحديد / تعديل الهدف", callback_data=f"target_set:{rep_id}")]]
+    if current:
+        buttons.append([InlineKeyboardButton("🗑️ حذف الهدف الحالي", callback_data=f"target_delete_confirm:{rep_id}")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def target_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     rep_id = int(query.data.split(":")[1])
@@ -1654,6 +1677,27 @@ async def target_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_keypad_kb(""),
     )
     return TARGET_AMOUNT
+
+
+async def target_delete_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rep_id = int(query.data.split(":")[1])
+    rep = get_user(rep_id)
+    await query.edit_message_text(
+        f"⚠️ هل تريد حذف هدف {rep['name']} لهذا الشهر؟",
+        reply_markup=yesno_kb(f"target_delete_do:{rep_id}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
+    )
+
+
+async def target_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("تم الحذف")
+    rep_id = int(query.data.split(":")[1])
+    m, y = month_year_now()
+    delete_target(rep_id, m, y)
+    rep = get_user(rep_id)
+    await query.edit_message_text(f"🗑️ تم حذف هدف {rep['name']} لشهر {MONTHS_AR[m-1]} {y}.")
 
 
 async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1840,6 +1884,20 @@ async def reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 
+def month_number_kb(prefix, year):
+    """لوحة اختيار الشهر بالأرقام فقط (1-12) مع تنقل بين السنوات."""
+    prev_y, next_y = year - 1, year + 1
+    rows = [[
+        InlineKeyboardButton("◀️", callback_data=f"{prefix}:nav:{prev_y}"),
+        InlineKeyboardButton(str(year), callback_data="noop"),
+        InlineKeyboardButton("▶️", callback_data=f"{prefix}:nav:{next_y}"),
+    ]]
+    grid = [InlineKeyboardButton(str(m), callback_data=f"{prefix}:pick:{year}:{m}") for m in range(1, 13)]
+    for i in range(0, 12, 4):
+        rows.append(grid[i:i + 4])
+    return InlineKeyboardMarkup(rows)
+
+
 async def report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1852,6 +1910,11 @@ async def report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("اختر المندوب:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
+    if kind == "month":
+        now = datetime.now()
+        await query.edit_message_text("📆 اختر الشهر (بالأرقام):", reply_markup=month_number_kb("genmonth", now.year))
+        return
+
     can_export = user_has_permission(session, "export_pdf")
 
     if kind == "today":
@@ -1859,12 +1922,6 @@ async def report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = get_total(rows)
         text = f"📅 تقرير اليوم ({datetime.now().strftime('%Y-%m-%d')})\n\nعدد العمليات: {len(rows)}\nالإجمالي: {total:,.2f} د.ل"
         context.user_data["last_report"] = ("general", rows, "تقرير اليوم")
-    elif kind == "month":
-        m, y = month_year_now()
-        rows = get_all_payments(m, y)
-        total = get_total(rows)
-        text = f"📆 تقرير الشهر ({MONTHS_AR[m-1]} {y})\n\nعدد العمليات: {len(rows)}\nالإجمالي: {total:,.2f} د.ل"
-        context.user_data["last_report"] = ("general", rows, f"شهر {MONTHS_AR[m-1]} {y}")
     elif kind == "method":
         totals = totals_by_method()
         grand = sum(totals.values())
@@ -1883,6 +1940,26 @@ async def report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
 
+async def genmonth_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    parts = query.data.split(":")
+    if parts[1] == "nav":
+        year = int(parts[2])
+        await query.edit_message_reply_markup(reply_markup=month_number_kb("genmonth", year))
+        return
+    year, month = int(parts[2]), int(parts[3])
+    rows = get_all_payments(month, year)
+    total = get_total(rows)
+    label = f"شهر {month}-{year}"
+    text = f"📆 تقرير {label}\n\nعدد العمليات: {len(rows)}\nالإجمالي: {total:,.2f} د.ل"
+    context.user_data["last_report"] = ("general", rows, label)
+    can_export = user_has_permission(session, "export_pdf")
+    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if can_export else None
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
 async def report_rep_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1894,11 +1971,53 @@ async def report_rep_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     target, collected, remaining, pct = current_month_target_progress(rep_id)
     text = (
         f"👨‍💼 تقرير المندوب: {rep['name']}\n\n"
-        f"عدد العمليات: {len(rows)}\nإجمالي التحصيل: {total:,.2f} د.ل\n\n"
+        f"عدد العمليات (كل الفترات): {len(rows)}\nإجمالي التحصيل (كل الفترات): {total:,.2f} د.ل\n\n"
         f"الهدف الشهري: {target:,.2f} د.ل\nالمحصل هذا الشهر: {collected:,.2f} د.ل\n"
         f"المتبقي: {remaining:,.2f} د.ل\nنسبة الإنجاز: {pct:.1f}%"
     )
     context.user_data["last_report"] = ("rep", rows, rep["name"])
+    can_export = user_has_permission(session, "export_pdf")
+    buttons = []
+    if can_export:
+        buttons.append([InlineKeyboardButton("📄 تصدير PDF (كل الفترات)", callback_data="export_report_pdf")])
+    buttons.append([InlineKeyboardButton("📅 سدادات شهر معيّن", callback_data=f"repmonth:{rep_id}:nav:{datetime.now().year}")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def repmonth_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    parts = query.data.split(":")
+    rep_id = int(parts[1])
+    rep = get_user(rep_id)
+    if parts[2] == "nav":
+        year = int(parts[3])
+        await query.edit_message_text(
+            f"📅 اختر الشهر (بالأرقام) لعرض سدادات {rep['name']}:",
+            reply_markup=month_number_kb(f"repmonthpick:{rep_id}", year),
+        )
+        return
+
+
+async def repmonthpick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    parts = query.data.split(":")  # repmonthpick : rep_id : action : year [: month]
+    rep_id = int(parts[1])
+    action = parts[2]
+    rep = get_user(rep_id)
+    if action == "nav":
+        year = int(parts[3])
+        await query.edit_message_reply_markup(reply_markup=month_number_kb(f"repmonthpick:{rep_id}", year))
+        return
+    year, month = int(parts[3]), int(parts[4])
+    rows = get_payments_by_rep(rep_id, month, year)
+    total = get_total(rows)
+    label = f"{rep['name']} - شهر {month}-{year}"
+    text = f"👨‍💼 سدادات {rep['name']} - شهر {month}-{year}\n\nعدد العمليات: {len(rows)}\nالإجمالي: {total:,.2f} د.ل"
+    context.user_data["last_report"] = ("rep", rows, label)
     can_export = user_has_permission(session, "export_pdf")
     buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if can_export else None
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
@@ -2147,6 +2266,9 @@ def build_app():
                 CallbackQueryHandler(assist_perms_cb, pattern="^assist_perms:"),
                 CallbackQueryHandler(perm_toggle_cb, pattern="^permtoggle:"),
                 CallbackQueryHandler(target_pick_cb, pattern="^target_pick:"),
+                CallbackQueryHandler(target_set_cb, pattern="^target_set:"),
+                CallbackQueryHandler(target_delete_confirm_cb, pattern="^target_delete_confirm:"),
+                CallbackQueryHandler(target_delete_do_cb, pattern="^target_delete_do:"),
                 CallbackQueryHandler(export_all_payments_pdf_cb, pattern="^export_all_payments_pdf$"),
                 CallbackQueryHandler(payment_edit_list_cb, pattern="^payment_edit_list$"),
                 CallbackQueryHandler(payment_view_cb, pattern="^payment_view:"),
@@ -2154,7 +2276,10 @@ def build_app():
                 CallbackQueryHandler(payment_delete_confirm_cb, pattern="^payment_delete_confirm:"),
                 CallbackQueryHandler(payment_delete_do_cb, pattern="^payment_delete_do:"),
                 CallbackQueryHandler(report_cb, pattern="^report:"),
+                CallbackQueryHandler(genmonth_cb, pattern="^genmonth:"),
                 CallbackQueryHandler(report_rep_pick_cb, pattern="^reportrep:"),
+                CallbackQueryHandler(repmonth_cb, pattern="^repmonth:"),
+                CallbackQueryHandler(repmonthpick_cb, pattern="^repmonthpick:"),
                 CallbackQueryHandler(export_report_pdf_cb, pattern="^export_report_pdf$"),
                 CallbackQueryHandler(msg_to_cb, pattern="^msgto:"),
                 CallbackQueryHandler(msg_pick_rep_cb, pattern="^msgrep:"),
