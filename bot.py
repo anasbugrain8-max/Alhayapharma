@@ -233,6 +233,27 @@ def get_user_by_username(username):
     return row
 
 
+def get_user_by_password(password):
+    """يبحث عن حساب نشط برقم سري مطابق، لدعم تسجيل الدخول بالرقم السري فقط."""
+    conn = get_db()
+    h = hash_password(password)
+    row = conn.execute("SELECT * FROM users WHERE password_hash=? AND active=1", (h,)).fetchone()
+    conn.close()
+    return row
+
+
+def password_in_use(password, exclude_user_id=None):
+    """يتحقق أن الرقم السري غير مستخدم من حساب آخر، حتى يبقى كل رقم سري فريداً للتعرف عليه عند الدخول."""
+    conn = get_db()
+    h = hash_password(password)
+    if exclude_user_id:
+        row = conn.execute("SELECT id FROM users WHERE password_hash=? AND id!=?", (h, exclude_user_id)).fetchone()
+    else:
+        row = conn.execute("SELECT id FROM users WHERE password_hash=?", (h,)).fetchone()
+    conn.close()
+    return row is not None
+
+
 def get_user(user_id):
     conn = get_db()
     row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
@@ -923,28 +944,23 @@ async def admin_setup_password(update: Update, context: ContextTypes.DEFAULT_TYP
     return LOGIN_USERNAME
 
 
-# ---- Login ----
+# ---- Login (بالرقم السري فقط) ----
 
 async def login_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text == "🔐 دخول":
-        await update.message.reply_text("اسم المستخدم:", reply_markup=CANCEL_KB)
-        return LOGIN_USERNAME
-    context.user_data["login_username"] = text
-    await update.message.reply_text("الرقم السري:")
-    return LOGIN_PASSWORD
+        await update.message.reply_text("🔑 الرقم السري:", reply_markup=CANCEL_KB)
+        return LOGIN_PASSWORD
+    await update.message.reply_text("اضغط على زر الدخول لتسجيل الدخول.", reply_markup=LOGIN_KB)
+    return LOGIN_USERNAME
 
 
 async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
-    username = context.user_data.get("login_username", "")
-    user = get_user_by_username(username)
-    if not user or not verify_password(password, user["password_hash"]):
-        await update.message.reply_text("❌ اسم المستخدم أو الرقم السري غير صحيح. حاول مرة أخرى.\n\nاسم المستخدم:")
-        return LOGIN_USERNAME
-    if not user["active"]:
-        await update.message.reply_text("⛔ هذا الحساب موقوف حالياً. تواصل مع الإدارة.", reply_markup=LOGIN_KB)
-        return LOGIN_USERNAME
+    user = get_user_by_password(password)
+    if not user:
+        await update.message.reply_text("❌ الرقم السري غير صحيح. حاول مرة أخرى.\n\n🔑 الرقم السري:")
+        return LOGIN_PASSWORD
     set_telegram_id(user["id"], update.effective_user.id)
     session = {"id": user["id"], "name": user["name"], "username": user["username"], "role": user["role"]}
     context.user_data["session"] = session
@@ -1362,8 +1378,13 @@ async def rep_editpass_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_rep_pass_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rep_id = context.user_data.pop("edit_rep_id", None)
+    password = update.message.text.strip()
     if rep_id:
-        update_user_password(rep_id, update.message.text.strip())
+        if password_in_use(password, exclude_user_id=rep_id):
+            context.user_data["edit_rep_id"] = rep_id  # نعيدها لإتاحة محاولة أخرى
+            await update.message.reply_text("⚠️ هذا الرقم السري مستخدم بالفعل لحساب آخر. اختر رقماً سرياً مختلفاً:")
+            return EDIT_REP_PASSWORD
+        update_user_password(rep_id, password)
         await update.message.reply_text("✅ تم تحديث الرقم السري.")
     await send_main_menu(update, context)
     return MAIN_MENU
@@ -1395,8 +1416,12 @@ async def add_rep_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_rep_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    if password_in_use(password):
+        await update.message.reply_text("⚠️ هذا الرقم السري مستخدم بالفعل لحساب آخر، لأن الدخول يعتمد على رقم سري فريد. اختر رقماً سرياً مختلفاً:")
+        return ADD_REP_PASSWORD
     data = context.user_data.pop("new_rep")
-    data["password"] = update.message.text.strip()
+    data["password"] = password
     create_user(data["name"], data["username"], data["password"], "representative")
     await update.message.reply_text(f"✅ تم إضافة المندوب بنجاح: {data['name']}")
     await send_main_menu(update, context)
@@ -1478,8 +1503,13 @@ async def assist_editpass_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def edit_assist_pass_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     assist_id = context.user_data.pop("edit_assist_id", None)
+    password = update.message.text.strip()
     if assist_id:
-        update_user_password(assist_id, update.message.text.strip())
+        if password_in_use(password, exclude_user_id=assist_id):
+            context.user_data["edit_assist_id"] = assist_id
+            await update.message.reply_text("⚠️ هذا الرقم السري مستخدم بالفعل لحساب آخر. اختر رقماً سرياً مختلفاً:")
+            return EDIT_ASSIST_PASSWORD
+        update_user_password(assist_id, password)
         await update.message.reply_text("✅ تم تحديث الرقم السري.")
     await send_main_menu(update, context)
     return MAIN_MENU
@@ -1537,8 +1567,12 @@ async def add_assist_username(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def add_assist_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    if password_in_use(password):
+        await update.message.reply_text("⚠️ هذا الرقم السري مستخدم بالفعل لحساب آخر، لأن الدخول يعتمد على رقم سري فريد. اختر رقماً سرياً مختلفاً:")
+        return ADD_ASSIST_PASSWORD
     data = context.user_data.pop("new_assist")
-    data["password"] = update.message.text.strip()
+    data["password"] = password
     uid = create_user(data["name"], data["username"], data["password"], "assistant")
     ensure_default_perms(uid)
     await update.message.reply_text(f"✅ تم إضافة المساعد: {data['name']}\n\nيمكنك الآن تحديد صلاحياته من قائمة 👨‍💼 المساعدين.")
