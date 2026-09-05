@@ -53,7 +53,42 @@ DB_PATH = os.environ.get("DB_PATH", "alhaya.db")
 COMPANY_NAME = "شركة الحياة فارما"
 BOT_TITLE = "💊 الحياة فارما – نظام التحصيل"
 LOGO_PATH = os.environ.get("LOGO_PATH", "logo.png")  # optional, if provided
-FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "NotoNaskhArabic-Regular.ttf")
+def _resolve_arabic_font_path():
+    """يبحث عن خط عربي صالح بعدة طرق، دون الحاجة لرفعه يدوياً:
+    1) ملف مرفوع يدوياً في fonts/NotoNaskhArabic-Regular.ttf (إن وُجد، له الأولوية دائماً).
+    2) مسارات شائعة لحزمة الخط عند تثبيتها عبر النظام (نُثبّتها تلقائياً على السيرفر عبر nixpacks.toml).
+    3) استعلام fontconfig (fc-match) عن أي خط يدعم العربية مثبّت على السيرفر.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.join(here, "fonts", "NotoNaskhArabic-Regular.ttf")
+    if os.path.exists(bundled):
+        return bundled
+
+    common_paths = [
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
+    ]
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["fc-match", "-f", "%{file}", ":lang=ar"],
+            capture_output=True, text=True, timeout=5,
+        )
+        found = result.stdout.strip()
+        if found and os.path.exists(found):
+            return found
+    except Exception:
+        pass
+
+    return bundled  # لم يُعثر على شيء؛ سيظهر تنبيه واضح للمستخدم لاحقاً
+
+
+FONT_PATH = _resolve_arabic_font_path()
 SESSION_TIMEOUT_MINUTES = 30
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
