@@ -622,9 +622,13 @@ def generate_rep_report_pdf(rep_name, rows, out_path, period_label="", target_in
             pdf.ln(7)
             pdf.cell(0, 7, ar(f"المحصل: {collected:,.2f} د.ل"), align="R", fill=True)
             pdf.ln(7)
-            pdf.cell(0, 7, ar(f"نسبة الإنجاز: {pct:.1f} بالمئة"), align="R", fill=True)
+            pdf.cell(0, 7, ar(f"نسبة الإنجاز: {pct:.0f}%"), align="R", fill=True)
             pdf.ln(7)
-            pdf.cell(0, 7, ar(f"المتبقي: {remaining:,.2f} د.ل"), align="R", fill=True)
+            if collected >= target:
+                surplus = collected - target
+                pdf.cell(0, 7, ar(f"تم تجاوز الهدف بمقدار {surplus:,.2f} د.ل"), align="R", fill=True)
+            else:
+                pdf.cell(0, 7, ar(f"المتبقي: {remaining:,.2f} د.ل"), align="R", fill=True)
             pdf.ln(9)
     pdf.ln(2)
     headers = ["طريقة السداد", "قيمة السداد", "تاريخ السداد", "اسم العميل"]
@@ -952,9 +956,17 @@ def current_month_target_progress(rep_id, month=None, year=None):
 def target_progress_text(target, collected, remaining, pct):
     if not target:
         return "🎯 لم يتم تحديد هدف شهري بعد لهذا المندوب."
+    pct_str = f"{pct:.0f}%"
+    if collected >= target:
+        surplus = collected - target
+        return (
+            f"🎯 الهدف الشهري: {target:,.2f} د.ل\n"
+            f"✅ تم تحصيل: {collected:,.2f} د.ل — نسبة الإنجاز: {pct_str}\n"
+            f"🎉 تم تحقيق الهدف بالكامل (تجاوز بمقدار {surplus:,.2f} د.ل)"
+        )
     return (
         f"🎯 الهدف الشهري: {target:,.2f} د.ل\n"
-        f"✅ تم تحصيل: {collected:,.2f} د.ل ({pct:.1f}%)\n"
+        f"✅ تم تحصيل: {collected:,.2f} د.ل — نسبة الإنجاز: {pct_str}\n"
         f"⏳ المتبقي للوصول للهدف: {remaining:,.2f} د.ل"
     )
 
@@ -1383,10 +1395,7 @@ async def rep_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"اسم المندوب: {rep['name']}\n"
         f"اسم المستخدم: {rep['username']}\n"
         f"الحالة: {'✅ نشط' if rep['active'] else '⛔ موقوف'}\n\n"
-        f"الهدف الشهري: {target:,.2f} د.ل\n"
-        f"المحصل: {collected:,.2f} د.ل\n"
-        f"المتبقي: {remaining:,.2f} د.ل\n"
-        f"نسبة الإنجاز: {pct:.1f}%\n\n"
+        f"{target_progress_text(target, collected, remaining, pct)}\n\n"
         f"عدد عمليات السداد (إجمالي): {count} عملية"
     )
     buttons = []
@@ -2009,8 +2018,7 @@ async def report_rep_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = (
         f"👨‍💼 تقرير المندوب: {rep['name']}\n\n"
         f"عدد العمليات (كل الفترات): {len(rows)}\nإجمالي التحصيل (كل الفترات): {total:,.2f} د.ل\n\n"
-        f"الهدف الشهري: {target:,.2f} د.ل\nالمحصل هذا الشهر: {collected:,.2f} د.ل\n"
-        f"المتبقي: {remaining:,.2f} د.ل\nنسبة الإنجاز: {pct:.1f}%"
+        f"{target_progress_text(target, collected, remaining, pct)}"
     )
     context.user_data["last_report"] = ("rep", rows, rep["name"], (target, collected, remaining, pct))
     can_export = user_has_permission(session, "export_pdf")
