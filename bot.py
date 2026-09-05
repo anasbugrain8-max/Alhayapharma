@@ -112,7 +112,7 @@ MONTHS_AR = [
 
 PERMISSIONS = {
     "view_representatives": "👥 مشاهدة المندوبين",
-    "view_payments": "💰 مشاهدة التحصيلات",
+    "view_payments": "💰 مشاهدة الجباية",
     "search_customers": "🔍 البحث عن العملاء",
     "view_reports": "📊 مشاهدة التقارير",
     "export_pdf": "📄 تصدير PDF",
@@ -739,7 +739,7 @@ REP_MENU_ROWS = [["💰 التحصيل", "🔍 البحث عن عميل"], ["�
 ADMIN_MENU_ROWS = [
     ["💰 التحصيل", "👥 المندوبين"],
     ["👨‍💼 المساعدين", "🎯 أهداف التحصيل"],
-    ["💰 التحصيلات", "🔍 البحث عن عميل"],
+    ["💰 الجباية", "🔍 البحث عن عميل"],
     ["📊 التقارير", "📩 إرسال رسالة"],
     ["🚪 خروج"],
 ]
@@ -763,7 +763,7 @@ def main_menu_kb(session):
     if perms.get("manage_targets"):
         rows2.append("🎯 أهداف التحصيل")
     if perms.get("view_payments"):
-        rows2.append("💰 التحصيلات")
+        rows2.append("💰 الجباية")
     rows3 = []
     if perms.get("search_customers"):
         rows3.append("🔍 البحث عن عميل")
@@ -1235,7 +1235,7 @@ async def save_payment_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def notify_admins_new_payment(context: ContextTypes.DEFAULT_TYPE, rep_session, data):
     """يرسل إشعاراً عند تسجيل المندوب لعملية سداد جديدة لكل حسابات المدير،
-    ولكل مساعد فعّل له المدير صلاحية '💰 مشاهدة التحصيلات'."""
+    ولكل مساعد فعّل له المدير صلاحية '💰 مشاهدة الجباية'."""
     text = (
         f"🔔 عملية سداد جديدة\n\n"
         f"👤 المندوب: {rep_session['name']}\n"
@@ -1777,7 +1777,7 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN / ASSISTANT: all payments overview (💰 التحصيلات)
+# ADMIN / ASSISTANT: all payments overview (💰 الجباية)
 # ============================================================
 
 async def payments_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1900,7 +1900,7 @@ async def export_all_payments_pdf_cb(update: Update, context: ContextTypes.DEFAU
     if not await check_pdf_ready(query.message):
         return
     path = f"/tmp/all_payments_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
-    await safe_send_pdf(query.message, generate_general_report_pdf, path, "جميع التحصيلات.pdf", rows)
+    await safe_send_pdf(query.message, generate_general_report_pdf, path, "جميع الجباية.pdf", rows)
 
 
 # ============================================================
@@ -2272,7 +2272,7 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await add_assist_start(update, context)
     if text == "🎯 أهداف التحصيل":
         return await targets_menu(update, context)
-    if text == "💰 التحصيلات":
+    if text == "💰 الجباية":
         return await payments_overview(update, context)
     if text == "📊 التقارير":
         return await reports_menu(update, context)
