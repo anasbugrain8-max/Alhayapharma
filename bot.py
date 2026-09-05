@@ -22,6 +22,7 @@ from telegram import (
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    BotCommand,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -32,6 +33,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
+    PicklePersistence,
     filters,
 )
 
@@ -131,9 +133,16 @@ DEFAULT_ON_PERMS = {"view_representatives", "view_payments", "search_customers",
 # DATABASE LAYER
 # ============================================================
 
+def _dict_row_factory(cursor, row):
+    """يحوّل كل صف مُسترجَع من قاعدة البيانات إلى dict عادي بدل sqlite3.Row،
+    حتى تبقى بيانات الجلسة (context.user_data) قابلة للحفظ الدائم (pickling)
+    عبر تحديثات البوت المتكررة دون فقدان تسجيل الدخول أو أي حالة مؤقتة."""
+    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = _dict_row_factory
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -1098,7 +1107,12 @@ async def admin_setup_password(update: Update, context: ContextTypes.DEFAULT_TYP
 async def login_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if "دخول" in text:
+        chat_id = update.effective_chat.id
+        current_id = update.effective_message.message_id if update.effective_message else None
         await update.message.reply_text("🔑 الرقم السري:", reply_markup=CANCEL_KB)
+        # مسح المحادثة السابقة تلقائياً في الخلفية عند الضغط على "دخول"، دون تعطيل الاستجابة
+        if current_id:
+            asyncio.create_task(_bulk_delete_chat_history(context.bot, chat_id, current_id - 1))
         return LOGIN_PASSWORD
     await update.message.reply_text("اضغط على زر الدخول لتسجيل الدخول.", reply_markup=LOGIN_KB)
     return LOGIN_USERNAME
@@ -2347,7 +2361,7 @@ async def msg_type_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = "جميع المندوبين" if target.get("type") == "all" else target.get("name", "")
     if kind == "custom":
         await query.edit_message_text(f"المرسل إليه: {label}")
-        await query.message.reply_text("اكتب نص الرسالة:", reply_markup=CANCEL_KB)
+        await query.message.reply_text("اكتب نص الرسالة، أو أرسل صورة مع تعليق (Caption):", reply_markup=CANCEL_KB)
         return MSG_BODY
     body = CANNED_MESSAGES.get(kind)
     if not body:
@@ -2361,12 +2375,18 @@ async def msg_type_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def msg_body_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    body = update.message.text.strip()
+    if update.message.photo:
+        body = (update.message.caption or "").strip()
+        context.user_data["msg_photo"] = update.message.photo[-1].file_id
+    else:
+        body = update.message.text.strip()
+        context.user_data.pop("msg_photo", None)
     context.user_data["msg_body"] = body
     target = context.user_data.get("msg_target", {})
     label = "جميع المندوبين" if target.get("type") == "all" else target.get("name", "")
+    photo_note = "📷 (مع صورة)\n" if context.user_data.get("msg_photo") else ""
     await update.message.reply_text(
-        f"هل تريد إرسال هذه الرسالة إلى {label}؟\n\n«{body}»",
+        f"هل تريد إرسال هذه الرسالة إلى {label}؟\n{photo_note}\n«{body}»",
         reply_markup=yesno_kb("msg_send_confirm", "msg_send_cancel", "✅ نعم، إرسال", "❌ إلغاء"),
     )
     return MAIN_MENU
@@ -2378,14 +2398,22 @@ async def msg_send_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     session = session_of(context)
     target = context.user_data.pop("msg_target", {})
     body = context.user_data.pop("msg_body", "")
-    text = f"📩 رسالة من الإدارة\n\n{body}"
+    photo = context.user_data.pop("msg_photo", None)
+    text = f"📩 رسالة من الإدارة\n\n{body}" if body else "📩 رسالة من الإدارة"
     sent = 0
+
+    async def _send(telegram_id):
+        if photo:
+            await context.bot.send_photo(telegram_id, photo=photo, caption=text)
+        else:
+            await context.bot.send_message(telegram_id, text)
+
     if target.get("type") == "all":
         reps = list_users_by_role("representative", active_only=True)
         for r in reps:
             if r["telegram_id"]:
                 try:
-                    await context.bot.send_message(r["telegram_id"], text)
+                    await _send(r["telegram_id"])
                     sent += 1
                 except Exception:
                     pass
@@ -2394,7 +2422,7 @@ async def msg_send_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
         rep = get_user(target.get("id"))
         if rep and rep["telegram_id"]:
             try:
-                await context.bot.send_message(rep["telegram_id"], text)
+                await _send(rep["telegram_id"])
                 sent += 1
             except Exception:
                 pass
@@ -2561,9 +2589,32 @@ async def unknown_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # APPLICATION SETUP
 # ============================================================
 
+async def _post_init(application: Application):
+    """يسجّل أمر /start في قائمة أوامر تيليجرام (زر الشرطة /)، بحيث يبقى متاحاً دائماً
+    بضغطة واحدة حتى لو ظهرت لوحة أزرار قديمة أو توقف البوت عن الاستجابة مؤقتاً."""
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "🔄 بدء / تسجيل الدخول"),
+        ])
+    except Exception:
+        pass
+
+
 def build_app():
     init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    # حفظ حالة الجلسات (تسجيل الدخول وما إلى ذلك) على نفس القرص الدائم لقاعدة البيانات،
+    # حتى لا يحتاج أي مستخدم لتسجيل الدخول من جديد أو مسح المحادثة بعد كل تحديث للبوت.
+    persistence_dir = os.path.dirname(DB_PATH) or "."
+    persistence_path = os.path.join(persistence_dir, "bot_persistence.pkl")
+    persistence = PicklePersistence(filepath=persistence_path)
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .persistence(persistence)
+        .post_init(_post_init)
+        .build()
+    )
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -2701,7 +2752,7 @@ def build_app():
             MSG_CHOOSE_TYPE: [CallbackQueryHandler(msg_type_cb, pattern="^msgtype:")],
             MSG_BODY: [
                 MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_body_do),
+                MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO, msg_body_do),
             ],
             FEEDBACK_BODY: [
                 MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
@@ -2720,6 +2771,8 @@ def build_app():
             CallbackQueryHandler(unknown_cb),
         ],
         allow_reentry=True,
+        persistent=True,
+        name="alhaya_conversation",
     )
 
     app.add_handler(conv)
