@@ -1183,7 +1183,8 @@ async def save_payment_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def notify_admins_new_payment(context: ContextTypes.DEFAULT_TYPE, rep_session, data):
-    """يرسل إشعاراً لجميع حسابات المدير عند تسجيل المندوب لعملية سداد جديدة."""
+    """يرسل إشعاراً عند تسجيل المندوب لعملية سداد جديدة لكل حسابات المدير،
+    ولكل مساعد فعّل له المدير صلاحية '💰 مشاهدة التحصيلات'."""
     text = (
         f"🔔 عملية سداد جديدة\n\n"
         f"👤 المندوب: {rep_session['name']}\n"
@@ -1192,10 +1193,15 @@ async def notify_admins_new_payment(context: ContextTypes.DEFAULT_TYPE, rep_sess
         f"💳 الطريقة: {data['method']}\n"
         f"📅 التاريخ: {data['payment_date']}"
     )
-    for admin in list_users_by_role("admin"):
-        if admin["telegram_id"]:
+    recipients = list(list_users_by_role("admin"))
+    for assistant in list_users_by_role("assistant", active_only=True):
+        perms = get_permissions(assistant["id"])
+        if perms.get("view_payments"):
+            recipients.append(assistant)
+    for user in recipients:
+        if user["telegram_id"]:
             try:
-                await context.bot.send_message(admin["telegram_id"], text)
+                await context.bot.send_message(user["telegram_id"], text)
             except Exception:
                 pass
 
