@@ -411,6 +411,20 @@ def update_payment_amount(payment_id, amount):
     conn.close()
 
 
+def update_payment_customer(payment_id, customer_name):
+    conn = get_db()
+    conn.execute("UPDATE payments SET customer_name=? WHERE id=?", (customer_name, payment_id))
+    conn.commit()
+    conn.close()
+
+
+def update_payment_date(payment_id, date_str):
+    conn = get_db()
+    conn.execute("UPDATE payments SET payment_date=? WHERE id=?", (date_str, payment_id))
+    conn.commit()
+    conn.close()
+
+
 def delete_payment(payment_id):
     conn = get_db()
     conn.execute("DELETE FROM payments WHERE id=?", (payment_id,))
@@ -935,16 +949,16 @@ async def keypad_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
 
 
-def build_calendar_kb(year, month):
+def build_calendar_kb(year, month, prefix="cal"):
     import calendar as _cal
     c = _cal.Calendar(firstweekday=6)  # يبدأ الأسبوع بالأحد
     weeks = c.monthdayscalendar(year, month)
     prev_y, prev_m = (year - 1, 12) if month == 1 else (year, month - 1)
     next_y, next_m = (year + 1, 1) if month == 12 else (year, month + 1)
     rows = [[
-        InlineKeyboardButton("◀️", callback_data=f"cal:nav:{prev_y}:{prev_m}"),
+        InlineKeyboardButton("◀️", callback_data=f"{prefix}:nav:{prev_y}:{prev_m}"),
         InlineKeyboardButton(f"{MONTHS_AR[month-1]} {year}", callback_data="noop"),
-        InlineKeyboardButton("▶️", callback_data=f"cal:nav:{next_y}:{next_m}"),
+        InlineKeyboardButton("▶️", callback_data=f"{prefix}:nav:{next_y}:{next_m}"),
     ]]
     day_labels = ["أحد", "اثنين", "ثلاثاء", "أربعاء", "خميس", "جمعة", "سبت"]
     rows.append([InlineKeyboardButton(d, callback_data="noop") for d in day_labels])
@@ -954,9 +968,9 @@ def build_calendar_kb(year, month):
             if day == 0:
                 row.append(InlineKeyboardButton(" ", callback_data="noop"))
             else:
-                row.append(InlineKeyboardButton(str(day), callback_data=f"cal:day:{year}:{month}:{day}"))
+                row.append(InlineKeyboardButton(str(day), callback_data=f"{prefix}:day:{year}:{month}:{day}"))
         rows.append(row)
-    rows.append([InlineKeyboardButton("📅 اليوم", callback_data="cal:today")])
+    rows.append([InlineKeyboardButton("📅 اليوم", callback_data=f"{prefix}:today")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -989,7 +1003,8 @@ def yesno_kb(yes_cb, no_cb, yes_label="✅ نعم", no_label="❌ إلغاء"):
     MSG_CHOOSE_TYPE,
     FEEDBACK_BODY,
     FEEDBACK_REPLY_BODY,
-) = range(32)
+    PAYMENT_EDIT_NAME,
+) = range(33)
 
 CB_METHOD = "method:"
 
@@ -2046,10 +2061,73 @@ async def payment_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 التاريخ: {p['payment_date']}"
     )
     buttons = [
+        [InlineKeyboardButton("✏️ تعديل اسم العميل", callback_data=f"payment_editname:{payment_id}")],
         [InlineKeyboardButton("✏️ تعديل القيمة", callback_data=f"payment_editamt:{payment_id}")],
+        [InlineKeyboardButton("✏️ تعديل التاريخ", callback_data=f"payment_editdate:{payment_id}")],
         [InlineKeyboardButton("🗑️ حذف العملية", callback_data=f"payment_delete_confirm:{payment_id}")],
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def payment_editname_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية تعديل السدادات.")
+        return
+    payment_id = int(query.data.split(":")[1])
+    context.user_data["edit_payment_name_id"] = payment_id
+    await query.message.reply_text("أدخل اسم العميل الجديد:", reply_markup=CANCEL_KB)
+    return PAYMENT_EDIT_NAME
+
+
+async def payment_editname_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment_id = context.user_data.pop("edit_payment_name_id", None)
+    if payment_id:
+        update_payment_customer(payment_id, update.message.text.strip())
+        await update.message.reply_text("✅ تم تحديث اسم العميل.")
+    await send_main_menu(update, context)
+    return MAIN_MENU
+
+
+async def payment_editdate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية تعديل السدادات.")
+        return
+    payment_id = int(query.data.split(":")[1])
+    context.user_data["edit_payment_date_id"] = payment_id
+    now = datetime.now()
+    await query.message.reply_text(
+        "📅 اختر التاريخ الجديد:",
+        reply_markup=build_calendar_kb(now.year, now.month, prefix="paydate"),
+    )
+
+
+async def paydate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")  # paydate : nav/day : ...
+    action = parts[1]
+    if action == "nav":
+        await query.answer()
+        y, m = int(parts[2]), int(parts[3])
+        await query.edit_message_reply_markup(reply_markup=build_calendar_kb(y, m, prefix="paydate"))
+        return
+    await query.answer()
+    payment_id = context.user_data.pop("edit_payment_date_id", None)
+    if action == "today":
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    else:
+        y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
+        date_str = f"{y:04d}-{m:02d}-{d:02d}"
+    if payment_id:
+        update_payment_date(payment_id, date_str)
+        await query.edit_message_text(f"✅ تم تحديث تاريخ السداد إلى: {date_str}")
+    else:
+        await query.edit_message_text("انتهت صلاحية هذه العملية، أعد المحاولة.")
 
 
 async def payment_editamt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2163,6 +2241,12 @@ async def report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📆 اختر الشهر (بالأرقام):", reply_markup=month_number_kb("genmonth", now.year))
         return
 
+    if kind == "method":
+        buttons = [[InlineKeyboardButton(m, callback_data=f"methodreport:{i}")] for i, m in enumerate(PAYMENT_METHODS)]
+        buttons.append([InlineKeyboardButton("📋 كل الطرق (ملخص إجمالي)", callback_data="methodreport:all")])
+        await query.edit_message_text("🏦 اختر طريقة السداد:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
     can_export = user_has_permission(session, "export_pdf")
 
     if kind == "today":
@@ -2170,12 +2254,6 @@ async def report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = get_total(rows)
         text = f"📅 تقرير اليوم ({datetime.now().strftime('%Y-%m-%d')})\n\nعدد العمليات: {len(rows)}\nالإجمالي: {total:,.2f} د.ل"
         context.user_data["last_report"] = ("general", rows, "تقرير اليوم")
-    elif kind == "method":
-        totals = totals_by_method()
-        grand = sum(totals.values())
-        lines = [f"{k}: {v:,.2f} د.ل" for k, v in totals.items()]
-        text = "🏦 تقرير حسب طريقة السداد\n\n" + "\n".join(lines) + f"\n\nالإجمالي: {grand:,.2f} د.ل"
-        context.user_data["last_report"] = ("method", totals, "")
     elif kind == "general":
         rows = get_all_payments()
         total = get_total(rows)
@@ -2208,6 +2286,28 @@ async def genmonth_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
 
+async def methodreport_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    can_export = user_has_permission(session, "export_pdf")
+    choice = query.data.split(":")[1]
+    if choice == "all":
+        totals = totals_by_method()
+        grand = sum(totals.values())
+        lines = [f"{k}: {v:,.2f} د.ل" for k, v in totals.items()]
+        text = "🏦 تقرير حسب طريقة السداد (ملخص كل الطرق)\n\n" + "\n".join(lines) + f"\n\nالإجمالي: {grand:,.2f} د.ل"
+        context.user_data["last_report"] = ("method", totals, "")
+    else:
+        method_name = PAYMENT_METHODS[int(choice)]
+        rows = [r for r in get_all_payments() if r["method"] == method_name]
+        total = get_total(rows)
+        text = f"🏦 طريقة السداد: {method_name}\n\nعدد العمليات: {len(rows)}\nالإجمالي: {total:,.2f} د.ل"
+        context.user_data["last_report"] = ("general", rows, method_name)
+    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if can_export else None
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
 async def report_rep_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2228,7 +2328,29 @@ async def report_rep_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if can_export:
         buttons.append([InlineKeyboardButton("📄 تصدير PDF (كل الفترات)", callback_data="export_report_pdf")])
     buttons.append([InlineKeyboardButton("📅 سدادات شهر معيّن", callback_data=f"repmonth:{rep_id}:nav:{datetime.now().year}")])
+    if user_has_permission(session, "edit_payments"):
+        buttons.append([InlineKeyboardButton("✏️ عرض/تعديل سداداته (آخر 15)", callback_data=f"replistedit:{rep_id}")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def replistedit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية تعديل السدادات.")
+        return
+    rep_id = int(query.data.split(":")[1])
+    rep = get_user(rep_id)
+    rows = get_payments_by_rep(rep_id)[:15]
+    if not rows:
+        await query.edit_message_text("لا توجد سدادات لهذا المندوب.")
+        return
+    buttons = [
+        [InlineKeyboardButton(f"{r['customer_name']} | {r['amount']:,.2f} د.ل | {r['payment_date']}", callback_data=f"payment_view:{r['id']}")]
+        for r in rows
+    ]
+    await query.edit_message_text(f"سدادات {rep['name']} — اختر عملية للتعديل:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def repmonth_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2655,11 +2777,16 @@ def build_app():
                 CallbackQueryHandler(payment_edit_list_cb, pattern="^payment_edit_list$"),
                 CallbackQueryHandler(payment_view_cb, pattern="^payment_view:"),
                 CallbackQueryHandler(payment_editamt_cb, pattern="^payment_editamt:"),
+                CallbackQueryHandler(payment_editname_cb, pattern="^payment_editname:"),
+                CallbackQueryHandler(payment_editdate_cb, pattern="^payment_editdate:"),
+                CallbackQueryHandler(paydate_cb, pattern="^paydate:"),
                 CallbackQueryHandler(payment_delete_confirm_cb, pattern="^payment_delete_confirm:"),
                 CallbackQueryHandler(payment_delete_do_cb, pattern="^payment_delete_do:"),
                 CallbackQueryHandler(report_cb, pattern="^report:"),
                 CallbackQueryHandler(genmonth_cb, pattern="^genmonth:"),
+                CallbackQueryHandler(methodreport_cb, pattern="^methodreport:"),
                 CallbackQueryHandler(report_rep_pick_cb, pattern="^reportrep:"),
+                CallbackQueryHandler(replistedit_cb, pattern="^replistedit:"),
                 CallbackQueryHandler(repmonth_cb, pattern="^repmonth:"),
                 CallbackQueryHandler(repmonthpick_cb, pattern="^repmonthpick:"),
                 CallbackQueryHandler(export_report_pdf_cb, pattern="^export_report_pdf$"),
@@ -2761,6 +2888,10 @@ def build_app():
             FEEDBACK_REPLY_BODY: [
                 MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_reply_body_do),
+            ],
+            PAYMENT_EDIT_NAME: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payment_editname_do),
             ],
         },
         fallbacks=[
