@@ -122,6 +122,7 @@ PERMISSIONS = {
     "delete_representatives": "🗑️ حذف المندوبين",
     "manage_targets": "🎯 تحديد الأهداف",
     "edit_payments": "✏️ تعديل/حذف السدادات",
+    "collect_payments": "💰 تسجيل عمليات تحصيل",
 }
 DEFAULT_ON_PERMS = {"view_representatives", "view_payments", "search_customers", "view_reports", "export_pdf", "send_messages"}
 
@@ -736,10 +737,10 @@ SKIP_CANCEL_KB = kb([["⏭️ تخطي"], ["❌ إلغاء الأمر"]])
 REP_MENU_ROWS = [["💰 التحصيل", "🔍 البحث عن عميل"], ["📊 تقرير السدادات"], ["🚪 خروج"]]
 
 ADMIN_MENU_ROWS = [
-    ["👥 المندوبين", "👨‍💼 المساعدين"],
-    ["🎯 أهداف التحصيل", "💰 التحصيلات"],
-    ["🔍 البحث عن عميل", "📊 التقارير"],
-    ["📩 إرسال رسالة"],
+    ["💰 التحصيل", "👥 المندوبين"],
+    ["👨‍💼 المساعدين", "🎯 أهداف التحصيل"],
+    ["💰 التحصيلات", "🔍 البحث عن عميل"],
+    ["📊 التقارير", "📩 إرسال رسالة"],
     ["🚪 خروج"],
 ]
 
@@ -753,11 +754,11 @@ def main_menu_kb(session):
     # assistant: build dynamically from permissions
     perms = get_permissions(session["id"])
     rows = []
-    r1 = []
+    r0 = []
+    if perms.get("collect_payments"):
+        r0.append("💰 التحصيل")
     if perms.get("view_representatives"):
-        r1.append("👥 المندوبين")
-    if perms.get("view_payments") or perms.get("manage_targets"):
-        pass
+        r0.append("👥 المندوبين")
     rows2 = []
     if perms.get("manage_targets"):
         rows2.append("🎯 أهداف التحصيل")
@@ -768,8 +769,8 @@ def main_menu_kb(session):
         rows3.append("🔍 البحث عن عميل")
     if perms.get("view_reports"):
         rows3.append("📊 التقارير")
-    if r1:
-        rows.append(r1)
+    if r0:
+        rows.append(r0)
     if rows2:
         rows.append(rows2)
     if rows3:
@@ -2249,7 +2250,11 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await logout(update, context)
 
     # representative
-    if text == "💰 التحصيل" and session["role"] == "representative":
+    if text == "💰 التحصيل" and (
+        session["role"] == "representative"
+        or session["role"] == "admin"
+        or user_has_permission(session, "collect_payments")
+    ):
         return await collect_start(update, context)
     if text == "🔍 البحث عن عميل":
         return await search_customer_start(update, context)
