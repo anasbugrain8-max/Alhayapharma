@@ -123,6 +123,7 @@ PERMISSIONS = {
     "manage_targets": "🎯 تحديد الأهداف",
     "edit_payments": "✏️ تعديل/حذف السدادات",
     "collect_payments": "💰 تسجيل عمليات تحصيل",
+    "receive_feedback": "📢 استلام بلاغ/فكرة تطوير",
 }
 DEFAULT_ON_PERMS = {"view_representatives", "view_payments", "search_customers", "view_reports", "export_pdf", "send_messages"}
 
@@ -194,6 +195,32 @@ def init_db():
             sent_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS feedback_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER,
+            sender_name TEXT,
+            sender_role TEXT,
+            body TEXT NOT NULL,
+            sent_at TEXT DEFAULT (datetime('now')),
+            replied INTEGER NOT NULL DEFAULT 0,
+            reply_body TEXT,
+            replied_by INTEGER,
+            replied_by_name TEXT,
+            replied_at TEXT
+        )
+    """)
+    # ترقية آمنة لقاعدة بيانات قديمة كانت موجودة قبل إضافة أعمدة الرد (لا تؤثر إذا كانت الأعمدة موجودة أصلاً)
+    for ddl in (
+        "ALTER TABLE feedback_messages ADD COLUMN reply_body TEXT",
+        "ALTER TABLE feedback_messages ADD COLUMN replied_by INTEGER",
+        "ALTER TABLE feedback_messages ADD COLUMN replied_by_name TEXT",
+        "ALTER TABLE feedback_messages ADD COLUMN replied_at TEXT",
+    ):
+        try:
+            c.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
@@ -494,6 +521,35 @@ def log_message(sender_id, recipient_id, recipient_type, body):
     conn.commit()
     conn.close()
 
+
+def add_feedback(sender_id, sender_name, sender_role, body):
+    conn = get_db()
+    c = conn.execute(
+        "INSERT INTO feedback_messages (sender_id, sender_name, sender_role, body) VALUES (?,?,?,?)",
+        (sender_id, sender_name, sender_role, body),
+    )
+    conn.commit()
+    fid = c.lastrowid
+    conn.close()
+    return fid
+
+
+def get_feedback(feedback_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM feedback_messages WHERE id=?", (feedback_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def save_feedback_reply(feedback_id, reply_body, replied_by_id, replied_by_name):
+    conn = get_db()
+    conn.execute(
+        "UPDATE feedback_messages SET replied=1, reply_body=?, replied_by=?, replied_by_name=?, replied_at=datetime('now') WHERE id=?",
+        (reply_body, replied_by_id, replied_by_name, feedback_id),
+    )
+    conn.commit()
+    conn.close()
+
 # ============================================================
 # PDF GENERATION (Arabic RTL support)
 # ============================================================
@@ -744,13 +800,14 @@ LOGIN_KB = kb([["🔐 دخول"]])
 CANCEL_KB = kb([["❌ إلغاء الأمر"]])
 SKIP_CANCEL_KB = kb([["⏭️ تخطي"], ["❌ إلغاء الأمر"]])
 
-REP_MENU_ROWS = [["💰 التحصيل", "🔍 البحث عن عميل"], ["📊 تقرير السدادات"], ["❌ إلغاء الأمر", "🚪 خروج"]]
+REP_MENU_ROWS = [["💰 التحصيل", "🔍 البحث عن عميل"], ["📊 تقرير السدادات"], ["📢 إبلاغ/فكرة تطوير"], ["❌ إلغاء الأمر", "🚪 خروج"]]
 
 ADMIN_MENU_ROWS = [
     ["💰 التحصيل", "👥 المندوبين"],
     ["👨‍💼 المساعدين", "🎯 أهداف التحصيل"],
     ["💰 الجباية", "🔍 البحث عن عميل"],
     ["📊 التقارير", "📩 إرسال رسالة"],
+    ["📢 إبلاغ/فكرة تطوير"],
     ["❌ إلغاء الأمر", "🚪 خروج"],
 ]
 
@@ -787,6 +844,7 @@ def main_menu_kb(session):
         rows.append(rows3)
     if perms.get("send_messages"):
         rows.append(["📩 إرسال رسالة"])
+    rows.append(["📢 إبلاغ/فكرة تطوير"])
     rows.append(["❌ إلغاء الأمر", "🚪 خروج"])
     return kb(rows)
 
@@ -920,7 +978,9 @@ def yesno_kb(yes_cb, no_cb, yes_label="✅ نعم", no_label="❌ إلغاء"):
     MSG_PICK_TARGET, MSG_BODY,
     ADMIN_SEARCH_CUSTOMER,
     MSG_CHOOSE_TYPE,
-) = range(30)
+    FEEDBACK_BODY,
+    FEEDBACK_REPLY_BODY,
+) = range(32)
 
 CB_METHOD = "method:"
 
@@ -2352,6 +2412,82 @@ async def msg_send_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await send_main_menu(query, context)
 
 
+# ============================================================
+# ALL USERS: feedback / development idea (📢 إبلاغ/فكرة تطوير)
+# ============================================================
+
+async def feedback_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_timeout(update, context):
+        return LOGIN_USERNAME
+    await update.message.reply_text(
+        "📢 اكتب رسالتك (بلاغ عن مشكلة أو فكرة تطوير) وستصل مباشرة إلى الإدارة:",
+        reply_markup=CANCEL_KB,
+    )
+    return FEEDBACK_BODY
+
+
+async def feedback_body_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = session_of(context)
+    body = update.message.text.strip()
+    fid = add_feedback(session["id"], session["name"], session["role"], body)
+    role_label = {"admin": "👑 المدير", "assistant": "👨‍💼 المساعد", "representative": "👤 المندوب"}[session["role"]]
+    notify_text = f"📢 بلاغ / فكرة تطوير جديدة\n\nمن: {session['name']} ({role_label})\n\n{body}"
+    reply_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ رد على هذا المستخدم", callback_data=f"feedback_reply:{fid}")]])
+    recipients = [a for a in list_users_by_role("admin") if a["id"] != session["id"]]
+    for assistant in list_users_by_role("assistant", active_only=True):
+        if assistant["id"] == session["id"]:
+            continue
+        if get_permissions(assistant["id"]).get("receive_feedback"):
+            recipients.append(assistant)
+    for user in recipients:
+        if user["telegram_id"]:
+            try:
+                await context.bot.send_message(user["telegram_id"], notify_text, reply_markup=reply_kb)
+            except Exception:
+                pass
+    await update.message.reply_text("✅ تم إرسال رسالتك للإدارة، شكراً لك.")
+    await send_main_menu(update, context)
+    return MAIN_MENU
+
+
+async def feedback_reply_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    allowed = session and (session["role"] == "admin" or user_has_permission(session, "receive_feedback"))
+    if not allowed:
+        await query.answer("⛔ ليست لديك صلاحية الرد على البلاغات.", show_alert=True)
+        return
+    fid = int(query.data.split(":")[1])
+    fb = get_feedback(fid)
+    if not fb:
+        await query.edit_message_text("هذا البلاغ لم يعد موجوداً.")
+        return
+    context.user_data["feedback_reply_id"] = fid
+    context.user_data["feedback_reply_to"] = fb["sender_id"]
+    await query.message.reply_text(f"اكتب ردك على {fb['sender_name']}:", reply_markup=CANCEL_KB)
+    return FEEDBACK_REPLY_BODY
+
+
+async def feedback_reply_body_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = session_of(context)
+    fid = context.user_data.pop("feedback_reply_id", None)
+    recipient_id = context.user_data.pop("feedback_reply_to", None)
+    body = update.message.text.strip()
+    if recipient_id:
+        recipient = get_user(recipient_id)
+        if recipient and recipient["telegram_id"]:
+            try:
+                await context.bot.send_message(recipient["telegram_id"], f"📩 رد من الإدارة على بلاغك:\n\n{body}")
+            except Exception:
+                pass
+        if fid:
+            save_feedback_reply(fid, body, session["id"], session["name"])
+        await update.message.reply_text("✅ تم إرسال الرد، وتم حفظ المحادثة كاملة بشكل دائم.")
+    await send_main_menu(update, context)
+    return MAIN_MENU
+
+
 async def noop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2409,6 +2545,8 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await reports_menu(update, context)
     if text == "📩 إرسال رسالة":
         return await msg_start(update, context)
+    if text == "📢 إبلاغ/فكرة تطوير":
+        return await feedback_start(update, context)
 
     await update.message.reply_text("الرجاء استخدام الأزرار في القائمة.", reply_markup=main_menu_kb(session))
     return MAIN_MENU
@@ -2479,6 +2617,7 @@ def build_app():
                 CallbackQueryHandler(msg_type_cb, pattern="^msgtype:"),
                 CallbackQueryHandler(msg_send_confirm_cb, pattern="^msg_send_confirm$"),
                 CallbackQueryHandler(msg_send_cancel_cb, pattern="^msg_send_cancel$"),
+                CallbackQueryHandler(feedback_reply_cb, pattern="^feedback_reply:"),
                 CallbackQueryHandler(noop_cb, pattern="^noop$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router),
             ],
@@ -2564,11 +2703,20 @@ def build_app():
                 MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_body_do),
             ],
+            FEEDBACK_BODY: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_body_do),
+            ],
+            FEEDBACK_REPLY_BODY: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_reply_body_do),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
             MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
             MessageHandler(filters.Regex("^🚪 خروج$"), logout),
+            CallbackQueryHandler(feedback_reply_cb, pattern="^feedback_reply:"),
             CallbackQueryHandler(unknown_cb),
         ],
         allow_reentry=True,
