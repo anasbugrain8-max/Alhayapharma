@@ -121,6 +121,7 @@ PERMISSIONS = {
     "edit_representatives": "✏️ تعديل المندوبين",
     "delete_representatives": "🗑️ حذف المندوبين",
     "manage_targets": "🎯 تحديد الأهداف",
+    "edit_payments": "✏️ تعديل/حذف السدادات",
 }
 DEFAULT_ON_PERMS = {"view_representatives", "view_payments", "search_customers", "view_reports", "export_pdf", "send_messages"}
 
@@ -353,6 +354,31 @@ def add_payment(customer_name, amount, method, payment_date, representative_id):
     pid = c.lastrowid
     conn.close()
     return pid
+
+
+def get_payment(payment_id):
+    conn = get_db()
+    row = conn.execute(
+        """SELECT p.*, u.name as rep_name FROM payments p JOIN users u ON u.id=p.representative_id
+           WHERE p.id=?""",
+        (payment_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def update_payment_amount(payment_id, amount):
+    conn = get_db()
+    conn.execute("UPDATE payments SET amount=? WHERE id=?", (amount, payment_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_payment(payment_id):
+    conn = get_db()
+    conn.execute("DELETE FROM payments WHERE id=?", (payment_id,))
+    conn.commit()
+    conn.close()
 
 
 def get_payments_by_rep(rep_id, month=None, year=None):
@@ -776,6 +802,14 @@ async def keypad_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"✅ تم حفظ الهدف الشهري لـ {rep['name']}: {amount:,.2f} د.ل")
             await send_main_menu(query, context)
             return MAIN_MENU
+        elif target == "edit_payment":
+            payment_id = context.user_data.pop("edit_payment_id", None)
+            session = session_of(context)
+            if payment_id and user_has_permission(session, "edit_payments"):
+                update_payment_amount(payment_id, amount)
+                await query.edit_message_text(f"✅ تم تحديث قيمة السداد إلى: {amount:,.2f} د.ل")
+            await send_main_menu(query, context)
+            return MAIN_MENU
         return None
 
     await query.answer()
@@ -790,7 +824,7 @@ async def keypad_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(cur) < 12:
             cur += action
     context.user_data["kp_value"] = cur
-    label = "قيمة السداد" if target == "collect" else "قيمة الهدف الشهري"
+    label = {"collect": "قيمة السداد", "target": "قيمة الهدف الشهري", "edit_payment": "القيمة الجديدة للسداد"}.get(target, "القيمة")
     await query.edit_message_text(
         f"أدخل {label} باستخدام لوحة الأرقام:\n\nالقيمة الحالية: {cur if cur else '0'}",
         reply_markup=build_keypad_kb(cur),
@@ -1625,9 +1659,17 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ الرجاء إدخال رقم صحيح أكبر من صفر:")
         return TARGET_AMOUNT
-    rep_id = context.user_data.pop("target_rep_id", None)
+    target = context.user_data.pop("kp_target", None)
     context.user_data.pop("kp_value", None)
-    context.user_data.pop("kp_target", None)
+    if target == "edit_payment":
+        payment_id = context.user_data.pop("edit_payment_id", None)
+        session = session_of(context)
+        if payment_id and user_has_permission(session, "edit_payments"):
+            update_payment_amount(payment_id, amount)
+            await update.message.reply_text(f"✅ تم تحديث قيمة السداد إلى: {amount:,.2f} د.ل")
+        await send_main_menu(update, context)
+        return MAIN_MENU
+    rep_id = context.user_data.pop("target_rep_id", None)
     if rep_id:
         m, y = month_year_now()
         set_target(rep_id, m, y, amount)
@@ -1661,9 +1703,97 @@ async def payments_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons = []
     if user_has_permission(session, "export_pdf"):
         buttons.append([InlineKeyboardButton("📄 تصدير PDF", callback_data="export_all_payments_pdf")])
+    if user_has_permission(session, "edit_payments"):
+        buttons.append([InlineKeyboardButton("✏️ تعديل / حذف سداد (آخر 10)", callback_data="payment_edit_list")])
     await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
     await send_main_menu(update, context)
     return MAIN_MENU
+
+
+async def payment_edit_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية تعديل السدادات.")
+        return
+    rows = get_all_payments()[:10]
+    if not rows:
+        await query.edit_message_text("لا توجد سدادات لتعديلها.")
+        return
+    buttons = [
+        [InlineKeyboardButton(f"{r['customer_name']} | {r['amount']:,.2f} د.ل | {r['payment_date']}", callback_data=f"payment_view:{r['id']}")]
+        for r in rows
+    ]
+    await query.edit_message_text("اختر عملية السداد:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def payment_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية تعديل السدادات.")
+        return
+    payment_id = int(query.data.split(":")[1])
+    p = get_payment(payment_id)
+    if not p:
+        await query.edit_message_text("هذه العملية لم تعد موجودة.")
+        return
+    text = (
+        f"👤 العميل: {p['customer_name']}\n"
+        f"👤 المندوب: {p['rep_name']}\n"
+        f"💰 القيمة: {p['amount']:,.2f} د.ل\n"
+        f"💳 الطريقة: {p['method']}\n"
+        f"📅 التاريخ: {p['payment_date']}"
+    )
+    buttons = [
+        [InlineKeyboardButton("✏️ تعديل القيمة", callback_data=f"payment_editamt:{payment_id}")],
+        [InlineKeyboardButton("🗑️ حذف العملية", callback_data=f"payment_delete_confirm:{payment_id}")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def payment_editamt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية تعديل السدادات.")
+        return
+    payment_id = int(query.data.split(":")[1])
+    context.user_data["edit_payment_id"] = payment_id
+    context.user_data["kp_target"] = "edit_payment"
+    context.user_data["kp_value"] = ""
+    await query.edit_message_text("أدخل القيمة الجديدة للسداد باستخدام لوحة الأرقام:\n\nالقيمة الحالية: 0")
+    await query.message.reply_text("لوحة الأرقام:", reply_markup=build_keypad_kb(""))
+    return TARGET_AMOUNT
+
+
+async def payment_delete_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    if not user_has_permission(session, "edit_payments"):
+        await query.edit_message_text("⛔ ليست لديك صلاحية تعديل السدادات.")
+        return
+    payment_id = int(query.data.split(":")[1])
+    await query.edit_message_text(
+        "⚠️ هل أنت متأكد من حذف عملية السداد هذه؟ لا يمكن التراجع بعد الحذف.",
+        reply_markup=yesno_kb(f"payment_delete_do:{payment_id}", "noop", "✅ نعم، حذف", "❌ إلغاء"),
+    )
+
+
+async def payment_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session = session_of(context)
+    if not user_has_permission(session, "edit_payments"):
+        await query.answer("⛔ ليست لديك صلاحية.", show_alert=True)
+        return
+    payment_id = int(query.data.split(":")[1])
+    delete_payment(payment_id)
+    await query.answer("تم الحذف")
+    await query.edit_message_text("🗑️ تم حذف عملية السداد بنجاح.")
 
 
 async def export_all_payments_pdf_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2012,6 +2142,11 @@ def build_app():
                 CallbackQueryHandler(perm_toggle_cb, pattern="^permtoggle:"),
                 CallbackQueryHandler(target_pick_cb, pattern="^target_pick:"),
                 CallbackQueryHandler(export_all_payments_pdf_cb, pattern="^export_all_payments_pdf$"),
+                CallbackQueryHandler(payment_edit_list_cb, pattern="^payment_edit_list$"),
+                CallbackQueryHandler(payment_view_cb, pattern="^payment_view:"),
+                CallbackQueryHandler(payment_editamt_cb, pattern="^payment_editamt:"),
+                CallbackQueryHandler(payment_delete_confirm_cb, pattern="^payment_delete_confirm:"),
+                CallbackQueryHandler(payment_delete_do_cb, pattern="^payment_delete_do:"),
                 CallbackQueryHandler(report_cb, pattern="^report:"),
                 CallbackQueryHandler(report_rep_pick_cb, pattern="^reportrep:"),
                 CallbackQueryHandler(export_report_pdf_cb, pattern="^export_report_pdf$"),
