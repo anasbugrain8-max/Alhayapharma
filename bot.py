@@ -50,7 +50,12 @@ from fpdf import FPDF
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8872405703:AAEIaRW2qsVW43TjIXoN-n1gDwYLE0MnRYM")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "متغيّر البيئة BOT_TOKEN غير موجود. أضِفه من إعدادات Railway (Variables) — "
+        "لن يتم كتابة أي توكن مباشرة داخل الكود لأسباب أمنية."
+    )
 DB_PATH = os.environ.get("DB_PATH", "alhaya.db")
 COMPANY_NAME = "شركة الحياة فارما"
 BOT_TITLE = "💊 الحياة فارما – نظام التحصيل"
