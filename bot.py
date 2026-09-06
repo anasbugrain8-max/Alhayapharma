@@ -1387,6 +1387,7 @@ ADMIN_MENU_ROWS = [
     ["📊 التقارير", "📩 إرسال رسالة"],
     ["📶 حالة المندوبين"],
     ["🏠 Home Use target", "🩺 Professional Use target"],
+    ["📅 تقرير بالتاريخ"],
     ["💵 مصروفات"],
     ["💼 صرف الرواتب الثابتة", "📊 مندوبي العمولة"],
     ["🏦 حسابات شركة الحياة فارما"],
@@ -1436,6 +1437,8 @@ def main_menu_kb(session):
         cat_row.append("🩺 Professional Use target")
     if cat_row:
         rows.append(cat_row)
+    if perms.get("manage_expenses") or perms.get("manage_payroll"):
+        rows.append(["📅 تقرير بالتاريخ"])
     if perms.get("manage_expenses"):
         rows.append(["💵 مصروفات"])
     if perms.get("manage_payroll"):
@@ -2924,6 +2927,28 @@ def get_expense(expense_id):
     return row
 
 
+def get_expenses_by_day(date_str):
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM expenses WHERE expense_date=? ORDER BY id DESC", (date_str,)).fetchall()
+    conn.close()
+    return rows
+
+
+def get_payroll_payments_by_day(date_str, emp_type=None):
+    conn = get_db()
+    q = """SELECT pp.*, pe.name as employee_name, pe.emp_type FROM payroll_payments pp
+           JOIN payroll_employees pe ON pe.id = pp.employee_id
+           WHERE date(pp.created_at) = ?"""
+    params = [date_str]
+    if emp_type:
+        q += " AND pe.emp_type = ?"
+        params.append(emp_type)
+    q += " ORDER BY pp.created_at DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return rows
+
+
 async def expenses_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_timeout(update, context):
         return LOGIN_USERNAME
@@ -2932,7 +2957,10 @@ async def expenses_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
         return MAIN_MENU
     recent = get_expenses()[:10]
-    buttons = [[InlineKeyboardButton("➕ إضافة مصروف", callback_data="expense_add_start")]]
+    buttons = [
+        [InlineKeyboardButton("➕ إضافة مصروف", callback_data="expense_add_start")],
+        [InlineKeyboardButton("📋 المصروفات المسجّلة (تصفّح بالتاريخ)", callback_data="expense_browse_start")],
+    ]
     for r in recent:
         buttons.append([InlineKeyboardButton(f"{r['expense_date']} | {r['amount']:,.0f} د.ل | {r['attribution_name']}", callback_data=f"expense_view:{r['id']}")])
     if get_expenses():
@@ -2940,6 +2968,41 @@ async def expenses_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "💵 المصروفات:" if recent else "💵 المصروفات:\n\nلا توجد مصروفات مسجّلة بعد."
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     return MAIN_MENU
+
+
+async def expense_browse_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    now = datetime.now()
+    await query.edit_message_text("📋 اختر يوماً لعرض مصروفاته:", reply_markup=build_calendar_kb(now.year, now.month, prefix="expbrowse"))
+
+
+async def expbrowse_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")  # expbrowse : nav/day/today : ...
+    if parts[1] == "nav":
+        await query.answer()
+        y, m = int(parts[2]), int(parts[3])
+        await query.edit_message_reply_markup(reply_markup=build_calendar_kb(y, m, prefix="expbrowse"))
+        return
+    await query.answer()
+    if parts[1] == "today":
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    else:
+        y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
+        date_str = f"{y:04d}-{m:02d}-{d:02d}"
+    rows = get_expenses_by_day(date_str)
+    if not rows:
+        await query.edit_message_text(
+            f"لا توجد مصروفات مسجّلة في {date_str}.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 اختيار يوم آخر", callback_data="expense_browse_start")]]),
+        )
+        return
+    total = get_total_expenses(rows)
+    buttons = [[InlineKeyboardButton(f"{r['amount']:,.0f} د.ل | {r['description']} | {r['attribution_name']}", callback_data=f"expense_view:{r['id']}")] for r in rows]
+    buttons.append([InlineKeyboardButton("📋 اختيار يوم آخر", callback_data="expense_browse_start")])
+    await query.edit_message_text(f"📋 مصروفات {date_str} (الإجمالي: {total:,.2f} د.ل):", reply_markup=InlineKeyboardMarkup(buttons))
+
 
 
 async def expense_add_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3594,6 +3657,128 @@ async def commission_report_cb(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["last_report"] = ("payroll", rows, "مندوبو العمولة", None)
     buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
+# ============================================================
+# تقرير موحّد بالتاريخ (📅 تقرير بالتاريخ) — مصروفات / مرتبات / نسب
+# ============================================================
+
+async def date_report_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_timeout(update, context):
+        return LOGIN_USERNAME
+    session = session_of(context)
+    if session["role"] != "admin" and not (user_has_permission(session, "manage_expenses") or user_has_permission(session, "manage_payroll")):
+        await update.message.reply_text("⛔ ليست لديك صلاحية لهذا القسم.")
+        return MAIN_MENU
+    buttons = [
+        [InlineKeyboardButton("📆 اختيار شهر", callback_data="dr_pickmonth")],
+        [InlineKeyboardButton("🗓️ اختيار يوم محدد", callback_data="dr_pickday")],
+    ]
+    await update.message.reply_text("📅 تقرير بالتاريخ — اختر طريقة التحديد:", reply_markup=InlineKeyboardMarkup(buttons))
+    return MAIN_MENU
+
+
+async def dr_pickmonth_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    now = datetime.now()
+    await query.edit_message_text("📆 اختر الشهر (بالأرقام):", reply_markup=month_number_kb("drmonth", now.year))
+
+
+async def dr_pickday_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    now = datetime.now()
+    await query.edit_message_text("🗓️ اختر اليوم:", reply_markup=build_calendar_kb(now.year, now.month, prefix="drday"))
+
+
+def dr_category_kb(period_kind, period_value):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 تقرير المصروفات", callback_data=f"drcat:expenses:{period_kind}:{period_value}")],
+        [InlineKeyboardButton("💼 تقرير المرتبات", callback_data=f"drcat:fixed:{period_kind}:{period_value}")],
+        [InlineKeyboardButton("📊 تقرير النسب", callback_data=f"drcat:commission:{period_kind}:{period_value}")],
+    ])
+
+
+async def drmonth_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    if parts[1] == "nav":
+        await query.edit_message_reply_markup(reply_markup=month_number_kb("drmonth", int(parts[2])))
+        return
+    year, month = int(parts[2]), int(parts[3])
+    period_value = f"{month}-{year}"
+    await query.edit_message_text(f"الفترة المختارة: شهر {period_value}\n\nاختر نوع التقرير:", reply_markup=dr_category_kb("month", period_value))
+
+
+async def drday_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")  # drday : nav/day/today : ...
+    if parts[1] == "nav":
+        await query.answer()
+        y, m = int(parts[2]), int(parts[3])
+        await query.edit_message_reply_markup(reply_markup=build_calendar_kb(y, m, prefix="drday"))
+        return
+    await query.answer()
+    if parts[1] == "today":
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    else:
+        y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
+        date_str = f"{y:04d}-{m:02d}-{d:02d}"
+    await query.edit_message_text(f"الفترة المختارة: يوم {date_str}\n\nاختر نوع التقرير:", reply_markup=dr_category_kb("day", date_str))
+
+
+async def drcat_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    _, category, period_kind, period_value = query.data.split(":")
+
+    if category == "expenses":
+        if not (session["role"] == "admin" or user_has_permission(session, "manage_expenses")):
+            await query.edit_message_text("⛔ ليست لديك صلاحية مشاهدة المصروفات.")
+            return
+        if period_kind == "month":
+            month, year = period_value.split("-")
+            rows = get_expenses(month=int(month), year=int(year))
+            label = f"شهر {period_value}"
+        else:
+            rows = get_expenses_by_day(period_value)
+            label = f"يوم {period_value}"
+        text = _show_and_export(rows, label)
+        context.user_data["last_report"] = ("expenses", rows, label, None)
+        pdf_pattern = "export_report_pdf"
+
+    else:  # fixed or commission
+        if not (session["role"] == "admin" or user_has_permission(session, "manage_payroll")):
+            await query.edit_message_text("⛔ ليست لديك صلاحية مشاهدة الرواتب/النسب.")
+            return
+        emp_ids = [e["id"] for e in list_payroll_employees() if e["emp_type"] == category]
+        if period_kind == "month":
+            month, year = period_value.split("-")
+            rows = [r for r in get_payroll_payments(month=int(month), year=int(year)) if r["employee_id"] in emp_ids]
+            label = f"شهر {period_value}"
+        else:
+            rows = [r for r in get_payroll_payments_by_day(period_value, emp_type=category)]
+            label = f"يوم {period_value}"
+        cat_title = "المرتبات" if category == "fixed" else "النسب"
+        if not rows:
+            await query.edit_message_text(f"لا توجد سجلات {cat_title} في {label}.")
+            return
+        total_paid = sum(r["paid_amount"] for r in rows)
+        lines = [f"📊 تقرير {cat_title} — {label}\n"]
+        for r in rows[:30]:
+            kind_label = "صرف" if r["kind"] == "payout" else "صرف رصيد محتجز"
+            lines.append(f"• {r['employee_name']} | {kind_label} | {r['paid_amount']:,.2f} د.ل")
+        lines.append(f"\nإجمالي المصروف: {total_paid:,.2f} د.ل")
+        text = "\n".join(lines)
+        context.user_data["last_report"] = ("payroll", rows, f"{cat_title} - {label}", None)
+        pdf_pattern = "export_report_pdf"
+
+    can_export = user_has_permission(session, "export_pdf")
+    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data=pdf_pattern)]] if can_export else None
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
 
 async def company_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4403,6 +4588,8 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await company_accounts_menu(update, context)
     if text == "💵 مصروفات":
         return await expenses_menu(update, context)
+    if text == "📅 تقرير بالتاريخ":
+        return await date_report_menu(update, context)
     if text == "💼 صرف الرواتب الثابتة":
         return await fixed_salaries_menu(update, context)
     if text == "📊 مندوبي العمولة":
@@ -4557,6 +4744,13 @@ def build_app():
                 CallbackQueryHandler(expmonthrep_cb, pattern="^expmonthrep:"),
                 CallbackQueryHandler(expdayrep_cb, pattern="^expdayrep:"),
                 CallbackQueryHandler(expdeptrep_cb, pattern="^expdeptrep:"),
+                CallbackQueryHandler(expense_browse_start_cb, pattern="^expense_browse_start$"),
+                CallbackQueryHandler(expbrowse_cb, pattern="^expbrowse:"),
+                CallbackQueryHandler(dr_pickmonth_cb, pattern="^dr_pickmonth$"),
+                CallbackQueryHandler(dr_pickday_cb, pattern="^dr_pickday$"),
+                CallbackQueryHandler(drmonth_cb, pattern="^drmonth:"),
+                CallbackQueryHandler(drday_cb, pattern="^drday:"),
+                CallbackQueryHandler(drcat_cb, pattern="^drcat:"),
                 CallbackQueryHandler(fixed_add_start_cb, pattern="^fixed_add_start$"),
                 CallbackQueryHandler(fixed_view_cb, pattern="^fixed_view:"),
                 CallbackQueryHandler(fixed_editamt_cb, pattern="^fixed_editamt:"),
