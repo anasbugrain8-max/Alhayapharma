@@ -1503,7 +1503,7 @@ async def keypad_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_main_menu(query, context)
             return MAIN_MENU
         elif target == "expense_amount":
-            context.user_data["expense"] = {"amount": amount}
+            context.user_data.setdefault("expense", {})["amount"] = amount
             await query.edit_message_text(f"💵 قيمة المصروف: {amount:,.2f} د.ل")
             await query.message.reply_text("أدخل بيان الصرف (وصف قصير للمصروف):", reply_markup=CANCEL_KB)
             return EXPENSE_DESC
@@ -1644,7 +1644,8 @@ def yesno_kb(yes_cb, no_cb, yes_label="✅ نعم", no_label="❌ إلغاء"):
     PAYROLL_EMP_NAME,
     PAYROLL_EMP_AMOUNT,
     PAYROLL_EDIT_AMOUNT,
-) = range(38)
+    EXP_REPORT_SEARCH,
+) = range(39)
 
 CB_METHOD = "method:"
 
@@ -2706,7 +2707,7 @@ async def target_amount_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_main_menu(update, context)
         return MAIN_MENU
     if target == "expense_amount":
-        context.user_data["expense"] = {"amount": amount}
+        context.user_data.setdefault("expense", {})["amount"] = amount
         await update.message.reply_text(f"💵 قيمة المصروف: {amount:,.2f} د.ل\n\nأدخل بيان الصرف (وصف قصير للمصروف):", reply_markup=CANCEL_KB)
         return EXPENSE_DESC
     if target == "payroll_new_fixed":
@@ -2961,22 +2962,55 @@ async def expense_desc_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if editing_id:
         update_expense_description(editing_id, text)
-        await update.message.reply_text("✅ تم تحديث البيان.")
+        await update.message.reply_text(
+            "✅ تم تحديث البيان.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="back_to_menu")]]),
+        )
         await send_main_menu(update, context)
         return MAIN_MENU
-    expense = context.user_data.pop("expense", {})
+    expense = context.user_data.get("expense", {})
     expense["description"] = text
+    context.user_data["expense"] = expense
     today = datetime.now().strftime("%Y-%m-%d")
-    eid = add_expense(expense["amount"], expense["description"], today, "department", None, expense["department"], session_of(context)["id"])
-    await update.message.reply_text(
-        "✅ تم تسجيل المصروف بنجاح\n\n"
-        f"🏷️ القسم: {expense['department']}\n"
-        f"💵 القيمة: {expense['amount']:,.2f} د.ل\n"
+    expense.setdefault("date", today)
+    summary = (
+        "يرجى تأكيد بيانات المصروف:\n\n"
+        f"🏷️ القسم: {expense.get('department', '-')}\n"
+        f"💵 القيمة: {expense.get('amount', 0):,.2f} د.ل\n"
         f"📝 البيان: {expense['description']}\n"
-        f"📅 التاريخ: {today} (تلقائي — اليوم)",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗓️ تغيير التاريخ", callback_data=f"expense_editdate:{eid}")]]),
+        f"📅 التاريخ: {expense['date']} (تلقائي — اليوم، يمكن تغييره بعد الحفظ)"
     )
-    await send_main_menu(update, context)
+    await update.message.reply_text(summary, reply_markup=yesno_kb("expense_save", "expense_cancel", "💾 حفظ", "❌ إلغاء"))
+    return EXPENSE_DESC
+
+
+async def expense_save_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    expense = context.user_data.pop("expense", {})
+    if query.data == "expense_cancel" or not expense:
+        await query.edit_message_text("تم الإلغاء.")
+        await send_main_menu(query, context)
+        return MAIN_MENU
+    try:
+        session = session_of(context)
+        today = expense.get("date") or datetime.now().strftime("%Y-%m-%d")
+        eid = add_expense(expense["amount"], expense["description"], today, "department", None, expense["department"], session["id"])
+        await query.edit_message_text(
+            "✅ تم تسجيل المصروف بنجاح\n\n"
+            f"🏷️ القسم: {expense['department']}\n"
+            f"💵 القيمة: {expense['amount']:,.2f} د.ل\n"
+            f"📝 البيان: {expense['description']}\n"
+            f"📅 التاريخ: {today}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗓️ تغيير التاريخ", callback_data=f"expense_editdate:{eid}")],
+                [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="back_to_menu")],
+            ]),
+        )
+    except Exception:
+        logger.exception("فشل حفظ المصروف")
+        await query.edit_message_text("❌ حدث خطأ أثناء حفظ المصروف. حاول مرة أخرى أو أبلغ الدعم الفني.")
+    await send_main_menu(query, context)
     return MAIN_MENU
 
 
@@ -3092,12 +3126,117 @@ async def expense_delete_do_cb(update: Update, context: ContextTypes.DEFAULT_TYP
 async def expense_report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    buttons = [
+        [InlineKeyboardButton("📋 كل المصروفات", callback_data="expreport:all")],
+        [InlineKeyboardButton("📅 حسب شهر (بالأرقام)", callback_data="expreport:month")],
+        [InlineKeyboardButton("🗓️ يوم محدد", callback_data="expreport:day")],
+        [InlineKeyboardButton("🔍 بحث بالبيان", callback_data="expreport:search")],
+        [InlineKeyboardButton("🏢 حسب القسم", callback_data="expreport:dept")],
+    ]
+    await query.edit_message_text("📊 تقرير المصروفات — اختر طريقة البحث:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+def _show_and_export(rows, label):
+    total = get_total_expenses(rows)
+    lines = [f"📊 تقرير المصروفات — {label}\n"]
+    for r in rows[:30]:
+        lines.append(f"• {r['expense_date']} | {r['amount']:,.2f} د.ل | {r['description']} | {r['attribution_name']}")
+    if len(rows) > 30:
+        lines.append(f"... و {len(rows)-30} عملية أخرى")
+    lines.append(f"\nإجمالي المصروفات: {total:,.2f} د.ل" if rows else "\nلا توجد نتائج مطابقة.")
+    return "\n".join(lines)
+
+
+async def expreport_dispatch_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     session = session_of(context)
-    rows = get_expenses()
-    text = show_expense_report(rows, "كل المصروفات")
-    context.user_data["last_report"] = ("expenses", rows, "كل المصروفات", None)
+    kind = query.data.split(":")[1]
+    if kind == "all":
+        rows = get_expenses()
+        text = _show_and_export(rows, "كل المصروفات")
+        context.user_data["last_report"] = ("expenses", rows, "كل المصروفات", None)
+        buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+    elif kind == "month":
+        now = datetime.now()
+        await query.edit_message_text("📅 اختر الشهر (بالأرقام):", reply_markup=month_number_kb("expmonthrep", now.year))
+    elif kind == "day":
+        now = datetime.now()
+        await query.edit_message_text("🗓️ اختر اليوم:", reply_markup=build_calendar_kb(now.year, now.month, prefix="expdayrep"))
+    elif kind == "dept":
+        buttons = [[InlineKeyboardButton(d, callback_data=f"expdeptrep:{i}")] for i, d in enumerate(EXPENSE_DEPARTMENTS)]
+        await query.edit_message_text("اختر القسم:", reply_markup=InlineKeyboardMarkup(buttons))
+    elif kind == "search":
+        await query.message.reply_text("🔍 اكتب كلمة أو جزءاً من البيان للبحث عنه:", reply_markup=CANCEL_KB)
+        return EXP_REPORT_SEARCH
+
+
+async def expmonthrep_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    parts = query.data.split(":")
+    if parts[1] == "nav":
+        await query.edit_message_reply_markup(reply_markup=month_number_kb("expmonthrep", int(parts[2])))
+        return
+    year, month = int(parts[2]), int(parts[3])
+    rows = get_expenses(month=month, year=year)
+    label = f"شهر {month}-{year}"
+    text = _show_and_export(rows, label)
+    context.user_data["last_report"] = ("expenses", rows, label, None)
     buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
+async def expdayrep_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")  # expdayrep : nav/day/today : ...
+    if parts[1] == "nav":
+        await query.answer()
+        y, m = int(parts[2]), int(parts[3])
+        await query.edit_message_reply_markup(reply_markup=build_calendar_kb(y, m, prefix="expdayrep"))
+        return
+    await query.answer()
+    session = session_of(context)
+    if parts[1] == "today":
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    else:
+        y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
+        date_str = f"{y:04d}-{m:02d}-{d:02d}"
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM expenses WHERE expense_date=? ORDER BY id DESC", (date_str,)).fetchall()
+    conn.close()
+    text = _show_and_export(rows, f"يوم {date_str}")
+    context.user_data["last_report"] = ("expenses", rows, f"يوم {date_str}", None)
+    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
+async def expdeptrep_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = session_of(context)
+    dept = EXPENSE_DEPARTMENTS[int(query.data.split(":")[1])]
+    rows = get_expenses(attribution_type="department", attribution_name=dept)
+    text = _show_and_export(rows, dept)
+    context.user_data["last_report"] = ("expenses", rows, dept, None)
+    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
+async def expreport_search_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = session_of(context)
+    keyword = update.message.text.strip()
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM expenses WHERE description LIKE ? ORDER BY expense_date DESC, id DESC", (f"%{keyword}%",)).fetchall()
+    conn.close()
+    text = _show_and_export(rows, f'بحث: "{keyword}"')
+    context.user_data["last_report"] = ("expenses", rows, f'بحث: "{keyword}"', None)
+    buttons = [[InlineKeyboardButton("📄 تصدير PDF", callback_data="export_report_pdf")]] if user_has_permission(session, "export_pdf") else None
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+    await send_main_menu(update, context)
+    return MAIN_MENU
 
 
 def show_expense_report(rows, label):
@@ -3220,7 +3359,10 @@ async def fixed_pay_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYP
     gross = (emp["fixed_amount"] or 0) + data.get("bonus", 0)
     add_payroll_payment(data["employee_id"], data["month"], data["year"], None, gross, 0, gross, session["id"])
     bonus_line = f"\n🎁 مكافأة إضافية: {data['bonus']:,.2f} د.ل" if data.get("bonus") else ""
-    await query.edit_message_text(f"✅ تم صرف راتب {emp['name']} بنجاح — الصافي: {gross:,.2f} د.ل{bonus_line}")
+    await query.edit_message_text(
+        f"✅ تم صرف راتب {emp['name']} بنجاح — الصافي: {gross:,.2f} د.ل{bonus_line}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="back_to_menu")]]),
+    )
 
 
 async def fixed_delete_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3378,7 +3520,10 @@ async def commission_pay_confirm_cb(update: Update, context: ContextTypes.DEFAUL
     add_payroll_payment(data["employee_id"], data["month"], data["year"], data["collected"], data["gross"], data["retained"], data["paid"], session["id"])
     if data["retained"]:
         add_to_retained_balance(data["employee_id"], data["retained"])
-    await query.edit_message_text(f"✅ تم صرف عمولة {emp['name']} بنجاح — الصافي: {data['paid']:,.2f} د.ل")
+    await query.edit_message_text(
+        f"✅ تم صرف عمولة {emp['name']} بنجاح — الصافي: {data['paid']:,.2f} د.ل",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="back_to_menu")]]),
+    )
 
 
 async def commission_release_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4184,6 +4329,12 @@ async def noop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("تم الإلغاء.")
 
 
+async def back_to_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_main_menu(query, context)
+
+
 # ============================================================
 # MAIN MENU ROUTER (text button dispatch while in MAIN_MENU state)
 # ============================================================
@@ -4397,6 +4548,10 @@ def build_app():
                 CallbackQueryHandler(expense_delete_confirm_cb, pattern="^expense_delete_confirm:"),
                 CallbackQueryHandler(expense_delete_do_cb, pattern="^expense_delete_do:"),
                 CallbackQueryHandler(expense_report_cb, pattern="^expense_report$"),
+                CallbackQueryHandler(expreport_dispatch_cb, pattern="^expreport:"),
+                CallbackQueryHandler(expmonthrep_cb, pattern="^expmonthrep:"),
+                CallbackQueryHandler(expdayrep_cb, pattern="^expdayrep:"),
+                CallbackQueryHandler(expdeptrep_cb, pattern="^expdeptrep:"),
                 CallbackQueryHandler(fixed_add_start_cb, pattern="^fixed_add_start$"),
                 CallbackQueryHandler(fixed_view_cb, pattern="^fixed_view:"),
                 CallbackQueryHandler(fixed_editamt_cb, pattern="^fixed_editamt:"),
@@ -4419,6 +4574,7 @@ def build_app():
                 CallbackQueryHandler(commission_report_cb, pattern="^commission_report$"),
                 CallbackQueryHandler(catmonth_cb, pattern="^catmonth:"),
                 CallbackQueryHandler(noop_cb, pattern="^noop$"),
+                CallbackQueryHandler(back_to_menu_cb, pattern="^back_to_menu$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router),
             ],
 
@@ -4517,7 +4673,12 @@ def build_app():
             ],
             EXPENSE_DESC: [
                 MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                CallbackQueryHandler(expense_save_cb, pattern="^(expense_save|expense_cancel)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_desc_do),
+            ],
+            EXP_REPORT_SEARCH: [
+                MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, expreport_search_do),
             ],
             PAYROLL_EMP_NAME: [
                 MessageHandler(filters.Regex("^❌ إلغاء الأمر$"), cancel_to_menu),
